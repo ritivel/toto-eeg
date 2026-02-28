@@ -7,8 +7,8 @@ This repository also hosts the code for evaluating time series models on BOOM (*
 
 ## Updates
 
-- 🎉🎉 **[Feb 2025] Fine-tuning Support**: You can now fine-tune Toto on your own datasets! Includes a ready-to-use training script, example configs, and a hands-on tutorial notebook to get you started.
-- 📈 **[Feb 2025] Exogenous Covariate Support**: Toto now supports known future exogenous covariates (e.g., weather forecasts, scheduled events) during both fine-tuning and inference to improve forecasting accuracy.
+- 🎉🎉 **[Feb 2026] Fine-tuning Support**: You can now fine-tune Toto on your own datasets! Includes a ready-to-use training script, example configs, and a hands-on tutorial notebook to get you started.
+- 📈 **[Feb 2026] Exogenous Covariate Support**: Toto now supports known future exogenous covariates (e.g., weather forecasts, scheduled events) during both fine-tuning and inference to improve forecasting accuracy.
 
 ## Table of Contents
 - [Updates](#updates)
