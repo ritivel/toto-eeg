@@ -715,6 +715,38 @@
   {
     "override_type": "replace",
     "target": {
+      "component": "unit-scaling"
+    },
+    "replacement": {
+      "name": "unit-scaling",
+      "origin": "https://github.com/graphcore-research/unit-scaling",
+      "license": [
+        "Apache-2.0"
+      ],
+      "copyright": [
+        "Graphcore Ltd."
+      ]
+    }
+  },
+  {
+    "override_type": "add",
+    "target": {
+      "origin": "https://github.com/DataDog/toto"
+    },
+    "replacement": {
+      "name": "dion",
+      "origin": "https://github.com/microsoft/dion",
+      "license": [
+        "MIT"
+      ],
+      "copyright": [
+        "Microsoft Corporation"
+      ]
+    }
+  },
+  {
+    "override_type": "replace",
+    "target": {
       "component": "uri-template",
       "origin": "pypi:uri-template"
     },
