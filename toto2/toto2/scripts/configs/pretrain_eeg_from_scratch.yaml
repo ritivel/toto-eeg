@@ -66,7 +66,10 @@ data:
     min_observed_frac: 0.8
     lazy: true                        # required for HBN scale (out-of-RAM)
     cache_size: 2                     # LRU recordings per worker
-    windows_per_file: 8               # logical windows reported per file
+    # ``windows_per_file`` * num_files = logical dataset length. With ~4k
+    # files this gives ~250k windows / epoch → ~3.9k optimizer steps per
+    # epoch on 8 H100s × batch 8. Crank up to keep epochs reasonable.
+    windows_per_file: 64
     transform:
       type: standardize_per_channel  # see examples/eeg_builder.py
 
@@ -98,7 +101,8 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 50
-  val_check_interval: 1000
+  val_check_interval: 1000          # every 1k optimizer steps
+  check_val_every_n_epoch: null     # do NOT bind to epochs; epoch length depends on data
   num_sanity_val_steps: 2
   refresh_rate: 50
   accelerator: gpu
