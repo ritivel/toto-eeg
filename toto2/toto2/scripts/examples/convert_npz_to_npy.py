@@ -55,12 +55,16 @@ def _convert_one(args: tuple[str, str, bool, str]) -> dict[str, object]:
         return {"ok": False, "src": src_s, "error": f"load: {e}"}
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".npy.part")
+    # ``np.save`` auto-appends ``.npy`` to the path if missing, so we need
+    # the temp file to NOT already end in ``.npy``. We pass a basename
+    # ending in ``.part`` and the actual saved file lands at ``<base>.npy``.
+    tmp_base = dst.with_suffix(".part")
+    tmp_written = tmp_base.with_suffix(".part.npy")
     try:
-        np.save(tmp, arr, allow_pickle=False)
-        tmp.replace(dst)
+        np.save(str(tmp_base), arr, allow_pickle=False)
+        tmp_written.replace(dst)
     except Exception as e:  # noqa: BLE001
-        for p in (tmp, dst):
+        for p in (tmp_base, tmp_written, dst):
             try:
                 if p.exists():
                     p.unlink()
