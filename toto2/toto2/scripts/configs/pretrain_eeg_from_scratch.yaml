@@ -10,7 +10,7 @@
 mode: from_scratch
 
 # Where to dump the final HF-format model (config.json + safetensors).
-output_dir: checkpoints/toto2_eeg_pretrained
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained
 
 # --------------------------------------------------------------------
 # Model architecture (passed to Toto2ModelConfig)
@@ -38,8 +38,8 @@ model:
 # --------------------------------------------------------------------
 data:
   context_length: 4096              # 64 patches @ patch_size=64
-  train_batch_size: 16
-  val_batch_size: 16
+  train_batch_size: 8               # per-rank batch on H100 80GB; 8x DDP -> 64 global
+  val_batch_size: 8
   num_workers: 4
   pin_memory: true
   persistent_workers: true
@@ -63,6 +63,9 @@ data:
     expected_channels: 129
     sliding_stride: 2048              # 50% overlap — augments while staying causal
     min_observed_frac: 0.8
+    lazy: true                        # required for HBN scale (out-of-RAM)
+    cache_size: 2                     # LRU recordings per worker
+    windows_per_file: 8               # logical windows reported per file
     transform:
       type: standardize_per_channel  # see examples/eeg_builder.py
 
@@ -96,13 +99,13 @@ trainer:
   log_every_n_steps: 50
   val_check_interval: 1000
   num_sanity_val_steps: 2
-  refresh_rate: 10
-  accelerator: auto
-  devices: auto
-  strategy: auto
+  refresh_rate: 50
+  accelerator: gpu
+  devices: 8                        # all H100s on the box
+  strategy: ddp_find_unused_parameters_false
 
 logging:
-  save_dir: lightning_logs
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
   name: toto2_eeg_pretrain
   tensorboard: true
   csv: true
@@ -113,7 +116,7 @@ logging:
   wandb_log_model: false            # too large to upload at every checkpoint
 
 checkpoint:
-  dirpath: checkpoints/toto2_eeg_pretrain
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain
   filename: "{epoch}-{step}-{val_loss:.4f}"
   monitor: val_loss
   mode: min
