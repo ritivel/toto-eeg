@@ -145,10 +145,14 @@ def _convert_one(args: tuple[str, str, bool]) -> dict[str, object]:
         }
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".part")
+    # ``np.savez_compressed`` always appends ".npz" to the filename if it's
+    # not already there. Build a tmp basename (no .npz) so the actual saved
+    # file lands at ``<tmp_base>.npz``; then atomically rename to out_path.
+    tmp_base = out_path.with_suffix(".part")
+    tmp_written = tmp_base.with_suffix(".part.npz")
     try:
         np.savez_compressed(
-            tmp_path,
+            str(tmp_base),
             data=data,
             sfreq=np.float32(sfreq),
             channels=channels,
@@ -156,10 +160,14 @@ def _convert_one(args: tuple[str, str, bool]) -> dict[str, object]:
             task=np.str_(task_run),
             release=np.str_(release),
         )
-        tmp_path.replace(out_path)
+        tmp_written.replace(out_path)
     except Exception as e:  # noqa: BLE001
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        for p in (tmp_base, tmp_written, out_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
         return {"ok": False, "path": set_path_s, "error": f"write: {e}"}
 
     return {
