@@ -23,7 +23,6 @@ yields, so it composes with :func:`toto2.training.collate_timeseries` and
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -32,31 +31,6 @@ import torch
 from torch.utils.data import Dataset
 
 from .datasets import SlidingWindowConfig
-
-
-@dataclass
-class _RecordingMeta:
-    """Per-file metadata used to plan windows without opening the file."""
-
-    path: str
-    n_channels: int
-    n_samples: int
-    series_id: int
-
-
-def _probe_npz(path: str, array_key: str) -> tuple[int, int]:
-    """Return ``(n_channels, n_samples)`` for an .npz array without copying."""
-    with np.load(path, allow_pickle=False) as f:
-        if array_key not in f.files:
-            raise KeyError(f"{path}: missing {array_key!r}")
-        # ``f[array_key]`` returns a NpzFile-resident array. We only want the
-        # shape, which is cheap to read out of the metadata header.
-        arr = f[array_key]
-        if arr.ndim == 1:
-            return 1, int(arr.shape[0])
-        if arr.ndim != 2:
-            raise ValueError(f"{path}: expected 1-D or 2-D; got {arr.shape}.")
-        return int(arr.shape[0]), int(arr.shape[1])
 
 
 class _LRUCache:
@@ -86,6 +60,13 @@ class _LRUCache:
 class LazyNpzTimeSeriesDataset(Dataset):
     """Sliding-window dataset that reads ``.npz`` files on demand.
 
+    The constructor only stores the path list — it never opens any file.
+    Length is reported as ``len(paths) * windows_per_file``, and each
+    ``__getitem__`` picks one (file, random offset) pair, decompresses the
+    file once (cached), and returns a window slice. This means the dataset
+    initialises in O(N) over filesystem listings — *not* over file
+    contents — so 100k+ files initialise in well under a second.
+
     Parameters
     ----------
     paths
@@ -93,13 +74,17 @@ class LazyNpzTimeSeriesDataset(Dataset):
         keyed by ``array_key`` representing one recording.
     config
         :class:`SlidingWindowConfig` controlling window size, stride, and
-        whether sampling is random.
+        whether sampling is random. ``stride`` is ignored in random mode;
+        in deterministic mode we yield one window per file at a fixed
+        offset (``stride * window_idx % T``-style sampling is not implemented
+        here — use :class:`ArrayTimeSeriesDataset` for full coverage).
     array_key
         Key under which the EEG array lives in the ``.npz``. Default
         ``"data"`` matches ``convert_hbn_to_npz.py``'s output.
     expected_channels
-        Optional sanity check; recordings whose first dim differs are
-        excluded from the index.
+        Optional sanity check; windows from recordings with the wrong
+        channel count are dropped at access time and a different file is
+        re-sampled (best-effort retry up to 8 times).
     transform
         Optional callable applied per-window after slicing. Useful for
         per-channel z-scoring etc.
@@ -112,6 +97,11 @@ class LazyNpzTimeSeriesDataset(Dataset):
     series_id_offset
         Added to the per-file integer id assigned to all variates of one
         recording — useful when concatenating multiple datasets.
+    windows_per_file
+        Number of "logical" windows reported per file in ``len(self)``.
+        Together with ``train_batch_size`` this controls one epoch's
+        nominal length. Each window is a fresh random offset into a
+        randomly-chosen file when ``config.random`` is True.
     """
 
     def __init__(
@@ -125,6 +115,7 @@ class LazyNpzTimeSeriesDataset(Dataset):
         nan_to_num: bool = True,
         cache_size: int = 2,
         series_id_offset: int = 0,
+        windows_per_file: int = 4,
     ) -> None:
         if not paths:
             raise ValueError("LazyNpzTimeSeriesDataset received an empty path list.")
@@ -133,88 +124,62 @@ class LazyNpzTimeSeriesDataset(Dataset):
         self.expected_channels = expected_channels
         self.transform = transform
         self.nan_to_num = nan_to_num
+        self.series_id_offset = int(series_id_offset)
+        self.windows_per_file = max(1, int(windows_per_file))
         self._cache = _LRUCache(cache_size)
-        self._rng = np.random.default_rng(config.seed)
 
-        self._meta: list[_RecordingMeta] = []
-        skipped = 0
-        for i, p in enumerate(sorted(str(x) for x in paths)):
-            try:
-                n_ch, n_samp = _probe_npz(p, array_key)
-            except (OSError, ValueError, KeyError) as e:
-                print(f"[lazy_npz] skip {p}: {e}", flush=True)
-                skipped += 1
-                continue
-            if expected_channels is not None and n_ch != expected_channels:
-                skipped += 1
-                continue
-            if n_samp < config.window_len:
-                skipped += 1
-                continue
-            self._meta.append(
-                _RecordingMeta(
-                    path=p,
-                    n_channels=n_ch,
-                    n_samples=n_samp,
-                    series_id=series_id_offset + i,
-                )
-            )
-        if not self._meta:
-            raise ValueError(
-                "No recording was long enough or matched expected_channels. "
-                f"Skipped {skipped} of {len(paths)}."
-            )
+        self._paths: list[str] = sorted(str(p) for p in paths)
+        # Worker-process-local cache of (n_channels, n_samples) discovered
+        # at first read. Skips files that turn out to be unusable.
+        self._known_shape: dict[int, tuple[int, int]] = {}
 
-        # Plan: deterministic (recording_idx, start) pairs covering the
-        # corpus once at the configured stride. Random sampling reuses the
-        # plan length but draws a fresh random offset per call.
-        plan: list[tuple[int, int]] = []
-        for rec_idx, meta in enumerate(self._meta):
-            max_start = meta.n_samples - config.window_len
-            for start in range(0, max_start + 1, config.stride):
-                plan.append((rec_idx, start))
-        if not plan:
-            raise ValueError("Sliding plan empty; check stride / window_len.")
-        self._plan = plan
-        if skipped:
-            print(
-                f"[lazy_npz] indexed {len(self._meta)} recordings "
-                f"({len(plan)} windows); skipped {skipped} files.",
-                flush=True,
-            )
+        print(
+            f"[lazy_npz] indexed {len(self._paths)} files "
+            f"(reporting {len(self._paths) * self.windows_per_file} logical windows)",
+            flush=True,
+        )
 
     def __len__(self) -> int:
-        return len(self._plan)
+        return len(self._paths) * self.windows_per_file
 
-    def _read_recording(self, rec_idx: int) -> np.ndarray:
-        cached = self._cache.get(rec_idx)
+    def _load_recording(self, file_idx: int) -> Optional[np.ndarray]:
+        cached = self._cache.get(file_idx)
         if cached is not None:
             return cached
-        meta = self._meta[rec_idx]
-        with np.load(meta.path, allow_pickle=False) as f:
-            arr = np.asarray(f[self.array_key], dtype=np.float32)
+        path = self._paths[file_idx]
+        try:
+            with np.load(path, allow_pickle=False) as f:
+                if self.array_key not in f.files:
+                    return None
+                arr = np.asarray(f[self.array_key], dtype=np.float32)
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
+            print(f"[lazy_npz] skip {path}: {e}", flush=True)
+            return None
         if arr.ndim == 1:
             arr = arr[None, :]
-        self._cache.put(rec_idx, arr)
+        if arr.ndim != 2:
+            return None
+        if self.expected_channels is not None and arr.shape[0] != self.expected_channels:
+            return None
+        if arr.shape[1] < self.config.window_len:
+            return None
+        self._known_shape[file_idx] = (int(arr.shape[0]), int(arr.shape[1]))
+        self._cache.put(file_idx, arr)
         return arr
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        rec_idx, det_start = self._plan[idx]
-        meta = self._meta[rec_idx]
+    def _sample_window(
+        self, file_idx: int, rng: np.random.Generator,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        recording = self._load_recording(file_idx)
+        if recording is None:
+            return None
 
+        n_ch, n_samp = recording.shape
+        max_start = n_samp - self.config.window_len
         if self.config.random:
-            # Derive randomness per-call from (worker_id, idx) so multiple
-            # DataLoader workers don't all draw the same sequence after fork.
-            worker_info = torch.utils.data.get_worker_info()
-            wid = worker_info.id if worker_info is not None else 0
-            seed_payload = (self.config.seed, wid, idx)
-            local_rng = np.random.default_rng(hash(seed_payload) & 0xFFFFFFFF)
-            max_start = meta.n_samples - self.config.window_len
-            start = int(local_rng.integers(0, max_start + 1)) if max_start > 0 else 0
+            start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
         else:
-            start = det_start
-
-        recording = self._read_recording(rec_idx)
+            start = 0
         window = recording[:, start : start + self.config.window_len]
 
         if self.transform is not None:
@@ -231,10 +196,36 @@ class LazyNpzTimeSeriesDataset(Dataset):
         target = torch.from_numpy(window_np).to(torch.float32)
         target_mask = torch.from_numpy(finite)
         series_ids = torch.full(
-            (target.shape[0],), meta.series_id, dtype=torch.long,
+            (n_ch,), self.series_id_offset + file_idx, dtype=torch.long,
         )
         return {
             "target": target,
             "target_mask": target_mask,
             "series_ids": series_ids,
         }
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        n_files = len(self._paths)
+
+        # Per-call RNG seeded by (config.seed, worker_id, idx) so multiple
+        # DataLoader workers don't draw the same sequence after fork.
+        worker_info = torch.utils.data.get_worker_info()
+        wid = worker_info.id if worker_info is not None else 0
+        seed_payload = (self.config.seed, wid, idx)
+        rng = np.random.default_rng(hash(seed_payload) & 0xFFFFFFFF)
+
+        if self.config.random:
+            file_idx = int(rng.integers(0, n_files))
+        else:
+            file_idx = idx % n_files
+
+        # Try the chosen file; on failure, walk forward up to 8 times.
+        for attempt in range(8):
+            sample = self._sample_window(file_idx, rng)
+            if sample is not None:
+                return sample
+            file_idx = (file_idx + 1) % n_files
+        raise RuntimeError(
+            f"LazyNpzTimeSeriesDataset: 8 consecutive files failed at idx={idx}; "
+            "check the source data for corruption / wrong channel counts."
+        )

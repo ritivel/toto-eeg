@@ -208,6 +208,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
     # tiny experiments where preloading is faster.
     use_lazy = bool(eeg_cfg.get("lazy", True))
     cache_size = int(eeg_cfg.get("cache_size", 2))
+    windows_per_file = int(eeg_cfg.get("windows_per_file", 4))
 
     if use_lazy:
         train_ds = LazyNpzTimeSeriesDataset(
@@ -217,6 +218,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
             expected_channels=expected_channels,
             transform=transform,
             cache_size=cache_size,
+            windows_per_file=windows_per_file,
         )
         val_ds: Optional[Dataset] = None
         if val_paths:
@@ -227,6 +229,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
                 expected_channels=expected_channels,
                 transform=transform,
                 cache_size=cache_size,
+                windows_per_file=max(1, windows_per_file // 2),
             )
         return train_ds, val_ds
 
