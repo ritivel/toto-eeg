@@ -40,9 +40,10 @@ data:
   context_length: 4096              # 64 patches @ patch_size=64
   train_batch_size: 8               # per-rank batch on H100 80GB; 8x DDP -> 64 global
   val_batch_size: 8
-  num_workers: 4
+  num_workers: 0                    # main-thread loading; DDP+spawned workers would
+                                    # need DDP context to unpickle the LightningModule
   pin_memory: true
-  persistent_workers: true
+  persistent_workers: false
   drop_last: true
 
   # Builder-specific knobs (consumed by your --dataset-builder)
