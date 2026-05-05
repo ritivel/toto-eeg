@@ -18,6 +18,14 @@ map_location: cpu                   # initial load device — moved to GPU by Tr
 
 output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_continued
 
+# The dataset builder reads model.patch_size to size sliding windows. In
+# continue_pretrain mode the published checkpoint defines the architecture,
+# but we still need to tell the data pipeline which patch_size to align to.
+# Datadog/Toto-2.0-22m uses patch_size=32 (verified against the public
+# config.json on HuggingFace).
+model:
+  patch_size: 32
+
 # --------------------------------------------------------------------
 # Data — same .npy mirror as the from-scratch run
 # --------------------------------------------------------------------
