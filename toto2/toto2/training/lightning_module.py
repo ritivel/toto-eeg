@@ -373,9 +373,12 @@ class Toto2ForTraining(L.LightningModule):
                 weight_decay=self.weight_decay,
                 independent_weight_decay=True,
                 allow_non_unit_scaling_params=True,
-                # CUDA-fused element-wise update; ~5% optimizer-step speedup
-                # on H100 and reduces kernel-launch overhead.
-                fused=True,
+                # NOTE: ``fused=True`` would give a small (~5%) speedup but
+                # Lightning's AMP precision plugin rejects gradient clipping
+                # with fused optimizers (see lightning.pytorch.plugins.
+                # precision.amp.MixedPrecisionPlugin.clip_gradients). We can
+                # re-enable when we either drop gradient_clip_val or move to
+                # bf16-true / a manual clipping hook.
             )
         elif self.optimizer_name == "normuon":
             optimizer = uu.NorMuon(  # type: ignore[call-arg]
