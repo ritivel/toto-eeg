@@ -1,0 +1,109 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — pre-train from scratch on EEG (small reference recipe).
+# --------------------------------------------------------------------
+# Approximate parameter count for the architecture below: ~22M (matches
+# the smallest published Toto 2.0 size that still gets meaningful zero-
+# shot performance).  Scale `model.d_model` / `model.num_layers` /
+# `data.context_length` to fit your hardware.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+# Where to dump the final HF-format model (config.json + safetensors).
+output_dir: checkpoints/toto2_eeg_pretrained
+
+# --------------------------------------------------------------------
+# Model architecture (passed to Toto2ModelConfig)
+# --------------------------------------------------------------------
+# `residual_attn_ratio` is computed automatically from
+# (data.context_length / model.patch_size) when omitted.
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12              # 11 time + 1 variate per group, like Toto 1.0
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 0.75               # Toto 2.0 design note (dd_unit_scaling/README)
+  residual_attn_ratio: null         # auto-derived
+
+# --------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------
+data:
+  context_length: 4096              # 64 patches @ patch_size=64
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  # Builder-specific knobs (consumed by your --dataset-builder)
+  eeg:
+    data_root: ./data/eeg
+    train_glob: "*train*.npz"
+    val_glob: "*val*.npz"
+    array_key: data
+    sfreq: 256
+    expected_channels: 19
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    transform:
+      type: standardize_per_channel  # see examples/eeg_builder.py
+
+# --------------------------------------------------------------------
+# Training (LR, optimizer, schedule)
+# --------------------------------------------------------------------
+training:
+  seed: 42
+  optimizer: adamw                  # adamw | normuon | dion2
+  base_lr: 5.0e-4
+  min_lr: 1.0e-5
+  warmup_steps: 2000
+  stable_steps: 80000
+  decay_steps: 8000
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  huber_kappa: 0.0                  # set 0.05 for very noisy / spiky data
+  log_grad_norm: true
+  compile: false
+  compile_mode: default
+  # world_size_override: 8          # uncomment if Lightning's world_size != DP degree
+
+# --------------------------------------------------------------------
+# Lightning Trainer
+# --------------------------------------------------------------------
+trainer:
+  max_steps: 90000                  # = warmup + stable + decay
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  val_check_interval: 1000
+  num_sanity_val_steps: 2
+  refresh_rate: 10
+  accelerator: auto
+  devices: auto
+  strategy: auto
+
+logging:
+  save_dir: lightning_logs
+  name: toto2_eeg_pretrain
+  tensorboard: true
+  csv: true
+
+checkpoint:
+  dirpath: checkpoints/toto2_eeg_pretrain
+  filename: "{epoch}-{step}-{val_loss:.4f}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 5000

@@ -1,0 +1,85 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — continue pre-training on EEG, starting from a published
+# checkpoint.  Recommended starting point for new domains because u-μP
+# learning rates transfer across model widths so the same recipe works
+# for 22M, 313M, 1B and 2.5B variants without re-tuning.
+# --------------------------------------------------------------------
+
+mode: continue_pretrain
+
+# HuggingFace repo id or local directory containing config.json + safetensors.
+# Pick a size that fits your GPU memory.
+pretrained_model_id: Datadog/Toto-2.0-22m
+map_location: cpu                   # initial load device — moved to GPU by Trainer
+
+output_dir: checkpoints/toto2_eeg_continued
+
+# --------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 8               # smaller — continued runs typically use bigger backbones
+  val_batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: ./data/eeg
+    train_glob: "*train*.npz"
+    val_glob: "*val*.npz"
+    array_key: data
+    sfreq: 256
+    expected_channels: 19
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    transform:
+      type: standardize_per_channel
+
+# --------------------------------------------------------------------
+# Training — note the lower LR and shorter schedule appropriate for
+# adaptation rather than from-scratch convergence.
+# --------------------------------------------------------------------
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 5.0e-5                   # 10× lower than from-scratch
+  min_lr: 1.0e-6
+  warmup_steps: 500
+  stable_steps: 15000
+  decay_steps: 1500
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                 # gentle smoothing helps with EEG outliers
+  log_grad_norm: true
+  compile: false
+
+trainer:
+  max_steps: 17000                  # warmup + stable + decay
+  accumulate_grad_batches: 2
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  num_sanity_val_steps: 2
+  refresh_rate: 10
+  accelerator: auto
+  devices: auto
+  strategy: auto
+
+logging:
+  save_dir: lightning_logs
+  name: toto2_eeg_continue_pretrain
+  tensorboard: true
+  csv: true
+
+checkpoint:
+  dirpath: checkpoints/toto2_eeg_continue_pretrain
+  filename: "{epoch}-{step}-{val_loss:.4f}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 1000
