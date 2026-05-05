@@ -29,6 +29,7 @@ from torch.utils.data import Dataset
 
 from toto2.training import (
     ArrayTimeSeriesDataset,
+    LazyNpzTimeSeriesDataset,
     SlidingWindowConfig,
 )
 
@@ -202,6 +203,34 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
         min_observed_frac=float(eeg_cfg.get("min_observed_frac", 0.5)),
     )
 
+    # ``lazy=true`` (default) opens each .npz on-demand inside DataLoader
+    # workers — required for any corpus larger than RAM. Set lazy=false for
+    # tiny experiments where preloading is faster.
+    use_lazy = bool(eeg_cfg.get("lazy", True))
+    cache_size = int(eeg_cfg.get("cache_size", 2))
+
+    if use_lazy:
+        train_ds = LazyNpzTimeSeriesDataset(
+            train_paths,
+            sliding_cfg_train,
+            array_key=array_key,
+            expected_channels=expected_channels,
+            transform=transform,
+            cache_size=cache_size,
+        )
+        val_ds: Optional[Dataset] = None
+        if val_paths:
+            val_ds = LazyNpzTimeSeriesDataset(
+                val_paths,
+                sliding_cfg_val,
+                array_key=array_key,
+                expected_channels=expected_channels,
+                transform=transform,
+                cache_size=cache_size,
+            )
+        return train_ds, val_ds
+
+    # ---- legacy in-memory path (small corpora only) ----
     train_recordings = _load_npz_recordings(
         train_paths,
         array_key=array_key,

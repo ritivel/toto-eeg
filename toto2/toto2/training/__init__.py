@@ -17,6 +17,7 @@ from .datasets import (
     HFTimeSeriesDataset,
     SlidingWindowConfig,
 )
+from .lazy_npz import LazyNpzTimeSeriesDataset
 from .losses import QuantileLoss, quantile_loss
 from .lightning_module import Toto2ForTraining
 from .scheduler import WarmupStableDecayLR
@@ -29,6 +30,7 @@ __all__ = [
     "TimeSeriesDataModule",
     "ArrayTimeSeriesDataset",
     "HFTimeSeriesDataset",
+    "LazyNpzTimeSeriesDataset",
     "SlidingWindowConfig",
     "collate_timeseries",
 ]
