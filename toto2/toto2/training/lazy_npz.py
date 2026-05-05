@@ -3,17 +3,27 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/)
 # Copyright 2026 Datadog, Inc.
 
-"""Lazy, file-backed sliding-window dataset for ``.npz`` recordings.
+"""Lazy, file-backed sliding-window dataset for ``.npz`` / ``.npy`` recordings.
 
 :class:`ArrayTimeSeriesDataset` keeps every recording resident in RAM, which
 becomes impractical past a few tens of GiB of audio/EEG data. This module
-provides a drop-in alternative that opens each ``.npz`` only when sampled,
+provides a drop-in alternative that opens each file only when sampled,
 reads exactly the window slice required, and never holds more than one
 recording in memory per worker.
 
+Two backends are supported, auto-detected from the file extension:
+
+- ``.npy``: loaded via ``np.load(..., mmap_mode='r')`` so the kernel
+  page-caches the file and per-window reads are zero-copy memory-mapped
+  slices. **Strongly preferred for fast training.**
+- ``.npz``: opened with ``np.load(...)`` which decompresses the entire
+  array into RAM each time. Useful when you cannot pre-decompress, but
+  expect 5-10× slower data loading than ``.npy``.
+
 A small in-process LRU cache softens the cost of repeatedly returning
-windows from the same recording within a single worker (common when stride
-is much smaller than recording length); set ``cache_size=0`` to disable.
+windows from the same recording within a single worker; set
+``cache_size=0`` to disable. For ``.npy`` files, the "cached" entry is
+already a memmap, so caching is essentially free.
 
 Each sample is the same dictionary that :class:`ArrayTimeSeriesDataset`
 yields, so it composes with :func:`toto2.training.collate_timeseries` and
@@ -148,10 +158,15 @@ class LazyNpzTimeSeriesDataset(Dataset):
             return cached
         path = self._paths[file_idx]
         try:
-            with np.load(path, allow_pickle=False) as f:
-                if self.array_key not in f.files:
-                    return None
-                arr = np.asarray(f[self.array_key], dtype=np.float32)
+            if path.endswith(".npy"):
+                # Memory-mapped read: kernel page-cache backs random slices,
+                # no decompression, no full-array materialisation.
+                arr = np.load(path, mmap_mode="r", allow_pickle=False)
+            else:
+                with np.load(path, allow_pickle=False) as f:
+                    if self.array_key not in f.files:
+                        return None
+                    arr = np.asarray(f[self.array_key], dtype=np.float32)
         except (OSError, ValueError, KeyError, RuntimeError) as e:
             print(f"[lazy_npz] skip {path}: {e}", flush=True)
             return None
@@ -180,14 +195,22 @@ class LazyNpzTimeSeriesDataset(Dataset):
             start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
         else:
             start = 0
-        window = recording[:, start : start + self.config.window_len]
+        # ``recording`` may be a numpy memmap (for .npy files); the slice is
+        # itself a memmap view. We always copy() into a fresh contiguous
+        # float32 buffer here because (a) downstream PyTorch wants a writable
+        # contiguous array, and (b) holding a memmap view alive blocks the
+        # kernel from evicting the page cache for that file.
+        window = np.asarray(
+            recording[:, start : start + self.config.window_len],
+            dtype=np.float32,
+        ).copy()
 
         if self.transform is not None:
-            window_t = torch.from_numpy(window.copy()).to(torch.float32)
+            window_t = torch.from_numpy(window).to(torch.float32)
             window_t = self.transform(window_t)
             window_np = window_t.numpy()
         else:
-            window_np = window.copy()
+            window_np = window
 
         finite = np.isfinite(window_np)
         if self.nan_to_num and not finite.all():

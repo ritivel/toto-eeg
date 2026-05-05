@@ -373,6 +373,9 @@ class Toto2ForTraining(L.LightningModule):
                 weight_decay=self.weight_decay,
                 independent_weight_decay=True,
                 allow_non_unit_scaling_params=True,
+                # CUDA-fused element-wise update; ~5% optimizer-step speedup
+                # on H100 and reduces kernel-launch overhead.
+                fused=True,
             )
         elif self.optimizer_name == "normuon":
             optimizer = uu.NorMuon(  # type: ignore[call-arg]

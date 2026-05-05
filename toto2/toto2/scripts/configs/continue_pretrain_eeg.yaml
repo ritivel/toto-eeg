@@ -3,44 +3,53 @@
 # checkpoint.  Recommended starting point for new domains because u-μP
 # learning rates transfer across model widths so the same recipe works
 # for 22M, 313M, 1B and 2.5B variants without re-tuning.
+#
+# Mumbai H100 layout (2026-W19): runs on 4 of 8 GPUs in parallel with the
+# from-scratch config — both share the same global batch (4 ranks × 16 = 64).
 # --------------------------------------------------------------------
 
 mode: continue_pretrain
 
 # HuggingFace repo id or local directory containing config.json + safetensors.
-# Pick a size that fits your GPU memory.
+# Pick a size that fits your GPU memory; 22m is the smallest that runs at
+# 100% GPU utilisation on H100s with our context_length / batch.
 pretrained_model_id: Datadog/Toto-2.0-22m
 map_location: cpu                   # initial load device — moved to GPU by Trainer
 
-output_dir: checkpoints/toto2_eeg_continued
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_continued
 
 # --------------------------------------------------------------------
-# Data
+# Data — same .npy mirror as the from-scratch run
 # --------------------------------------------------------------------
 data:
   context_length: 4096
-  train_batch_size: 8               # smaller — continued runs typically use bigger backbones
-  val_batch_size: 8
+  train_batch_size: 16              # 4 ranks × 16 = 64 global, matches from-scratch
+  val_batch_size: 16
   num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
   pin_memory: true
   persistent_workers: true
   drop_last: true
 
   eeg:
-    data_root: ./data/eeg
-    train_glob: "*train*.npz"
-    val_glob: "*val*.npz"
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
     array_key: data
-    sfreq: 256
-    expected_channels: 19
+    sfreq: 500
+    expected_channels: 129
     sliding_stride: 2048
     min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
     transform:
       type: standardize_per_channel
 
 # --------------------------------------------------------------------
-# Training — note the lower LR and shorter schedule appropriate for
-# adaptation rather than from-scratch convergence.
+# Training — lower LR, shorter schedule, Huber-smoothed loss for noisy data.
 # --------------------------------------------------------------------
 training:
   seed: 42
@@ -54,29 +63,37 @@ training:
   betas: [0.9, 0.95]
   huber_kappa: 0.05                 # gentle smoothing helps with EEG outliers
   log_grad_norm: true
-  compile: false
+  compile: true                     # u-µP modules are torch.compile-friendly
+  compile_mode: default
+  matmul_precision: high
 
 trainer:
   max_steps: 17000                  # warmup + stable + decay
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 1
   precision: bf16-mixed
   gradient_clip_val: 1.0
   log_every_n_steps: 25
   val_check_interval: 500
+  check_val_every_n_epoch: null
   num_sanity_val_steps: 2
-  refresh_rate: 10
-  accelerator: auto
-  devices: auto
-  strategy: auto
+  refresh_rate: 50
+  accelerator: gpu
+  devices: 4                        # other 4 H100s; runs in parallel with from-scratch
+  strategy: ddp_find_unused_parameters_false
 
 logging:
-  save_dir: lightning_logs
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
   name: toto2_eeg_continue_pretrain
   tensorboard: true
   csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_continue_22m_optimized
+  wandb_tags: [hbn, continue_pretrain, mumbai_h100, optimized, npy_mmap, compile]
+  wandb_log_model: false
 
 checkpoint:
-  dirpath: checkpoints/toto2_eeg_continue_pretrain
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_continue_pretrain
   filename: "{epoch}-{step}-{val_loss:.4f}"
   monitor: val_loss
   mode: min

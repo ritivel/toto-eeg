@@ -38,25 +38,22 @@ model:
 # --------------------------------------------------------------------
 data:
   context_length: 4096              # 64 patches @ patch_size=64
-  train_batch_size: 8               # per-rank batch on H100 80GB; 8x DDP -> 64 global
-  val_batch_size: 8
-  num_workers: 0                    # main-thread loading; DDP+spawned workers would
-                                    # need DDP context to unpickle the LightningModule
+  train_batch_size: 16              # per-rank batch on H100 80GB; 4x DDP -> 64 global
+  val_batch_size: 16
+  num_workers: 4                    # mp_context=fork avoids DDP-unpickle issues
+  multiprocessing_context: fork
+  prefetch_factor: 4
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
   drop_last: true
 
   # Builder-specific knobs (consumed by your --dataset-builder)
-  # Defaults below match the HBN .npz layout produced by
-  # `convert_hbn_to_npz.py` on the Mumbai H100 box (see plan).
+  # Default points at the .npy mirror produced by convert_npz_to_npy.py;
+  # falls back to .npz seamlessly via LazyNpzTimeSeriesDataset's
+  # extension-based autodetect.
   eeg:
-    data_root: /opt/dlami/nvme/eeg/npz
-    # eeg_builder uses train_glob / val_glob to split files. Holding out
-    # all subjects from the BIDS R5 release as validation matches the
-    # Evaluation Suite's release-based subject-disjoint convention.
-    # We approximate that with a deterministic 90/10 subject split via
-    # `val_holdout_pattern` when `val_glob` is null (see eeg_builder.py).
-    train_glob: "sub-*/task-*.npz"
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
     val_glob: null
     val_fraction: 0.05
     array_key: data
@@ -88,9 +85,10 @@ training:
   betas: [0.9, 0.95]
   huber_kappa: 0.0                  # set 0.05 for very noisy / spiky data
   log_grad_norm: true
-  compile: false
-  compile_mode: default
-  # world_size_override: 8          # uncomment if Lightning's world_size != DP degree
+  compile: true                     # torch.compile (mode=default) -> ~30-50% speedup
+  compile_mode: default             # "reduce-overhead" uses CUDA graphs (more memory)
+  matmul_precision: high            # TF32 / TC-class matmuls; ~10% on H100
+  # world_size_override: 4          # uncomment if Lightning's world_size != DP degree
 
 # --------------------------------------------------------------------
 # Lightning Trainer
@@ -106,7 +104,7 @@ trainer:
   num_sanity_val_steps: 2
   refresh_rate: 50
   accelerator: gpu
-  devices: 8                        # all H100s on the box
+  devices: 4                        # 4 H100s for from-scratch; the other 4 run continued
   strategy: ddp_find_unused_parameters_false
 
 logging:
@@ -116,8 +114,8 @@ logging:
   csv: true
   wandb: true                       # WANDB_API_KEY must be set (.env supported)
   wandb_project: toto2-eeg
-  wandb_run_name: hbn_npz_from_scratch_22m
-  wandb_tags: [hbn, from_scratch, mumbai_h100]
+  wandb_run_name: hbn_from_scratch_22m_optimized
+  wandb_tags: [hbn, from_scratch, mumbai_h100, optimized, npy_mmap, compile]
   wandb_log_model: false            # too large to upload at every checkpoint
 
 checkpoint:

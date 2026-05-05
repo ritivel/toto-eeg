@@ -11,6 +11,7 @@ Lightning-native pipeline with proper sharding-aware DataLoaders.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from typing import Optional
 
 from lightning import LightningDataModule
@@ -49,6 +50,16 @@ class TimeSeriesDataModule(LightningDataModule):
         DDP/FSDP to avoid uneven batches that change u-μP scale factors.
     pad_series_id
         Series id assigned to padding variates (default ``-1``).
+    multiprocessing_context
+        Optional name of the ``multiprocessing`` start method for DataLoader
+        workers (``"fork"``, ``"forkserver"``, ``"spawn"``). Default ``"fork"``
+        when ``num_workers > 0``: forking inherits the DDP-wrapped model
+        without re-pickling, which avoids the
+        ``Default process group has not been initialized`` error you get
+        from spawn'd workers under Lightning DDP. Set explicitly to
+        ``"spawn"`` if your dataset holds CUDA tensors / non-fork-safe state.
+    prefetch_factor
+        Number of batches each worker prefetches.
     """
 
     def __init__(
@@ -63,6 +74,8 @@ class TimeSeriesDataModule(LightningDataModule):
         persistent_workers: bool = False,
         drop_last: bool = True,
         pad_series_id: int = -1,
+        multiprocessing_context: Optional[str] = "fork",
+        prefetch_factor: Optional[int] = 2,
     ) -> None:
         super().__init__()
         self.train_dataset = train_dataset
@@ -74,20 +87,36 @@ class TimeSeriesDataModule(LightningDataModule):
         self.persistent_workers = bool(persistent_workers) and self.num_workers > 0
         self.drop_last = bool(drop_last)
         self.pad_series_id = int(pad_series_id)
+        self.multiprocessing_context = multiprocessing_context
+        self.prefetch_factor = prefetch_factor
 
     def _collate(self, samples):
         return collate_timeseries(samples, pad_series_id=self.pad_series_id)
+
+    def _dataloader_kwargs(self) -> dict:
+        kw: dict = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "collate_fn": self._collate,
+        }
+        if self.num_workers > 0:
+            # Verify the requested mp context exists; fall back to default
+            # if not (e.g. ``fork`` on Windows).
+            ctx_name = self.multiprocessing_context
+            if ctx_name and ctx_name in mp.get_all_start_methods():
+                kw["multiprocessing_context"] = mp.get_context(ctx_name)
+            kw["persistent_workers"] = self.persistent_workers
+            if self.prefetch_factor is not None:
+                kw["prefetch_factor"] = int(self.prefetch_factor)
+        return kw
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            collate_fn=self._collate,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
             drop_last=self.drop_last,
+            **self._dataloader_kwargs(),
         )
 
     def val_dataloader(self) -> Optional[DataLoader]:
@@ -97,9 +126,6 @@ class TimeSeriesDataModule(LightningDataModule):
             self.val_dataset,
             batch_size=self.val_batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=self._collate,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
             drop_last=False,
+            **self._dataloader_kwargs(),
         )

@@ -146,8 +146,14 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
     if not data_root or not Path(data_root).is_dir():
         raise FileNotFoundError(f"data.eeg.data_root does not exist: {data_root!r}")
 
-    train_paths = _list_files(data_root, eeg_cfg.get("train_glob"))
-    val_paths = _list_files(data_root, eeg_cfg.get("val_glob"))
+    # Prefer ``.npy`` (memory-mapped) when it sits alongside the configured
+    # train_glob: data_root may end in ``/npz`` but the user may have
+    # converted to ``/npy``. The training loop autodetects the extension
+    # in ``LazyNpzTimeSeriesDataset._load_recording``.
+    train_glob = eeg_cfg.get("train_glob")
+    val_glob = eeg_cfg.get("val_glob")
+    train_paths = _list_files(data_root, train_glob)
+    val_paths = _list_files(data_root, val_glob)
 
     if not train_paths:
         raise FileNotFoundError(

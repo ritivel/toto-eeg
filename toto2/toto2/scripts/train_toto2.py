@@ -375,6 +375,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     seed = int(cfg.get("training", {}).get("seed", 42))
     L.seed_everything(seed, workers=True)
 
+    # Allow TF32-class matmuls everywhere torch sees an opportunity.
+    # On H100 with bf16-mixed AMP this is essentially free and avoids the
+    # "tensor cores are not being used to their full potential" warning.
+    matmul_precision = cfg.get("training", {}).get("matmul_precision", "high")
+    torch.set_float32_matmul_precision(str(matmul_precision))
+
     if args.print_config:
         print(json.dumps(cfg, indent=2, default=str))
         return 0
@@ -385,15 +391,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- Lightning components ----
     lightning_module = build_lightning_module(cfg)
+    data_cfg = cfg.get("data", {})
     data_module = TimeSeriesDataModule(
         train_dataset=train_ds,
         val_dataset=val_ds,
-        train_batch_size=int(cfg.get("data", {}).get("train_batch_size", 16)),
-        val_batch_size=int(cfg.get("data", {}).get("val_batch_size", 16)),
-        num_workers=int(cfg.get("data", {}).get("num_workers", 4)),
-        pin_memory=bool(cfg.get("data", {}).get("pin_memory", True)),
-        persistent_workers=bool(cfg.get("data", {}).get("persistent_workers", False)),
-        drop_last=bool(cfg.get("data", {}).get("drop_last", True)),
+        train_batch_size=int(data_cfg.get("train_batch_size", 16)),
+        val_batch_size=int(data_cfg.get("val_batch_size", 16)),
+        num_workers=int(data_cfg.get("num_workers", 4)),
+        pin_memory=bool(data_cfg.get("pin_memory", True)),
+        persistent_workers=bool(data_cfg.get("persistent_workers", False)),
+        drop_last=bool(data_cfg.get("drop_last", True)),
+        multiprocessing_context=data_cfg.get("multiprocessing_context", "fork"),
+        prefetch_factor=data_cfg.get("prefetch_factor", 2),
     )
     trainer = build_trainer(cfg)
 
