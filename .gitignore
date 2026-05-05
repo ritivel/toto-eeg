@@ -58,3 +58,8 @@ env/
 # Cache
 **/.mypy_cache
 **/.pytest_cache
+
+# Secrets / env
+.env
+.env.*
+!.env.example

@@ -82,6 +82,47 @@ def load_config(path: str | os.PathLike) -> Dict[str, Any]:
     return cfg
 
 
+def load_dotenv(path: str | os.PathLike) -> int:
+    """Load ``KEY=VALUE`` lines from a `.env`-style file into ``os.environ``.
+
+    No external dependency. Lines starting with ``#`` and blank lines are
+    skipped. Existing environment variables are not overwritten so a value
+    explicitly exported in the shell wins over the file.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return 0
+    n = 0
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            n += 1
+    return n
+
+
+def _flatten_for_wandb(cfg: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    """Flatten a nested config dict into a single-level mapping for wandb.
+
+    Lists / scalars pass through; nested dicts become ``parent.child`` keys.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in cfg.items():
+        kk = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten_for_wandb(v, prefix=f"{kk}."))
+        else:
+            out[kk] = v
+    return out
+
+
 def import_builder(spec: str) -> DatasetBuilder:
     """Resolve ``module.path:callable`` into a callable."""
     if ":" not in spec:
@@ -197,6 +238,27 @@ def build_trainer(cfg: Dict[str, Any]) -> L.Trainer:
                 name=str(lcfg.get("name", "toto2_training")),
             )
         )
+    if lcfg.get("wandb", False):
+        # Import lazily so wandb is only required when actually enabled.
+        try:
+            from lightning.pytorch.loggers import WandbLogger
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "logging.wandb=true requires `wandb` and lightning's WandbLogger. "
+                "Install with `pip install wandb`."
+            ) from e
+
+        wandb_kwargs = {
+            "project": lcfg.get("wandb_project") or os.environ.get("WANDB_PROJECT", "toto2-eeg"),
+            "entity": lcfg.get("wandb_entity") or os.environ.get("WANDB_ENTITY"),
+            "name": lcfg.get("wandb_run_name"),
+            "tags": list(lcfg.get("wandb_tags", []) or []) or None,
+            "save_dir": str(lcfg.get("save_dir", "lightning_logs")),
+            "log_model": bool(lcfg.get("wandb_log_model", False)),
+            "config": _flatten_for_wandb(cfg),
+        }
+        wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
+        loggers.append(WandbLogger(**wandb_kwargs))
 
     trainer_kwargs: Dict[str, Any] = dict(
         max_steps=int(tcfg.get("max_steps", 100_000)),
@@ -277,7 +339,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Print the resolved config and exit.",
     )
+    parser.add_argument(
+        "--env-file",
+        type=str,
+        default=None,
+        help="Optional .env file to load secrets / settings from. Auto-detected "
+             "as ./.env (cwd) and the repo root .env if not specified.",
+    )
     args = parser.parse_args(argv)
+
+    # Load secrets from .env (cwd, then repo root). Existing env vars win.
+    candidate_env_files: list[Path] = []
+    if args.env_file is not None:
+        candidate_env_files.append(Path(args.env_file))
+    candidate_env_files.append(Path.cwd() / ".env")
+    # Best-effort: walk up from this script to find a repo-level .env
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate_env_files.append(parent / ".env")
+        if (parent / ".git").exists():
+            break
+    for env_path in candidate_env_files:
+        n_loaded = load_dotenv(env_path)
+        if n_loaded > 0:
+            print(f"[train_toto2] loaded {n_loaded} key(s) from {env_path}")
 
     cfg = load_config(args.config)
     if args.seed is not None:
