@@ -153,6 +153,27 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
             f"No training files matched in {data_root} (glob={eeg_cfg.get('train_glob')!r})."
         )
 
+    # If no explicit val glob, hold out a deterministic fraction of subject
+    # directories for validation so train/val are subject-disjoint (matches
+    # the Evaluation Suite's release-based split convention).
+    if not val_paths:
+        val_fraction = float(eeg_cfg.get("val_fraction", 0.0))
+        if val_fraction > 0.0:
+            seed = int(config.get("training", {}).get("seed", 42))
+            subject_dirs = sorted({os.path.dirname(p) for p in train_paths})
+            rng = np.random.default_rng(seed)
+            order = rng.permutation(len(subject_dirs))
+            n_val = max(1, int(len(subject_dirs) * val_fraction))
+            val_dirs = {subject_dirs[i] for i in order[:n_val]}
+            val_paths = [p for p in train_paths if os.path.dirname(p) in val_dirs]
+            train_paths = [p for p in train_paths if os.path.dirname(p) not in val_dirs]
+            print(
+                f"[eeg_builder] Holding out {len(val_dirs)} of {len(subject_dirs)} "
+                f"subjects ({val_fraction:.0%}) for validation; "
+                f"train={len(train_paths)} val={len(val_paths)} files.",
+                flush=True,
+            )
+
     array_key = str(eeg_cfg.get("array_key", "data"))
     expected_channels = eeg_cfg.get("expected_channels")
     if expected_channels is not None:

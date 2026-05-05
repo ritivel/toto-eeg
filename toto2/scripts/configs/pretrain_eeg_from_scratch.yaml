@@ -46,14 +46,22 @@ data:
   drop_last: true
 
   # Builder-specific knobs (consumed by your --dataset-builder)
+  # Defaults below match the HBN .npz layout produced by
+  # `convert_hbn_to_npz.py` on the Mumbai H100 box (see plan).
   eeg:
-    data_root: ./data/eeg
-    train_glob: "*train*.npz"
-    val_glob: "*val*.npz"
+    data_root: /opt/dlami/nvme/eeg/npz
+    # eeg_builder uses train_glob / val_glob to split files. Holding out
+    # all subjects from the BIDS R5 release as validation matches the
+    # Evaluation Suite's release-based subject-disjoint convention.
+    # We approximate that with a deterministic 90/10 subject split via
+    # `val_holdout_pattern` when `val_glob` is null (see eeg_builder.py).
+    train_glob: "sub-*/task-*.npz"
+    val_glob: null
+    val_fraction: 0.05
     array_key: data
-    sfreq: 256
-    expected_channels: 19
-    sliding_stride: 2048
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048              # 50% overlap — augments while staying causal
     min_observed_frac: 0.8
     transform:
       type: standardize_per_channel  # see examples/eeg_builder.py
