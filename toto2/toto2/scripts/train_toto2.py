@@ -207,8 +207,13 @@ def build_trainer(cfg: Dict[str, Any]) -> L.Trainer:
 
     callbacks: list[Any] = [
         TQDMProgressBar(refresh_rate=int(tcfg.get("refresh_rate", 1))),
-        LearningRateMonitor(logging_interval="step"),
     ]
+    # LearningRateMonitor requires at least one logger; only attach it when
+    # we'll actually have one (TensorBoard / CSV / WandB).
+    has_logger = any(lcfg.get(k, default) for k, default in
+                     [("tensorboard", True), ("csv", True), ("wandb", False)])
+    if has_logger:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
     if "dirpath" in cckpt:
         callbacks.append(
             ModelCheckpoint(
