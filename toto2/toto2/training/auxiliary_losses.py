@@ -748,19 +748,21 @@ class PARSHead(nn.Module):
         self.num_pairs = int(num_pairs)
         if d_model % head_dim != 0:
             raise ValueError(f"d_model {d_model} must be divisible by head_dim {head_dim}")
+
+        # We use a hand-rolled scaled-dot-product cross-attention rather
+        # than ``nn.MultiheadAttention``.  The latter has internal
+        # ``nn.Linear`` layers without u-μP metadata, so under our
+        # ``base_lr=0.3`` (the trunk's u-μP-balanced LR) those layers
+        # train at an enormous effective LR and rapidly produce NaN.
+        # The hand-rolled version uses :class:`uu.Linear` everywhere
+        # so the optimiser applies the correct per-parameter LR scale.
         self.num_heads = d_model // head_dim
         self.head_dim = head_dim
+        self.qkv_proj = uu.Linear(d_model, 3 * d_model, bias=True, constraint=None)
+        self.attn_out = uu.Linear(d_model, d_model, bias=True, constraint=None)
+        # 1/d_k scale (u-μP convention, matching SelfAttention in toto2.model).
+        self._attn_scale = 1.0 / float(self.head_dim)
 
-        # Cross-attention: tokens (Q) attend to all sampled tokens (K, V).
-        # nn.MultiheadAttention's internal Linear layers are not u-μP-aware
-        # but the head is small (~1 layer) and we weight it 0.1, so the
-        # mismatch is bounded.  An option for v2 of this probe is to
-        # implement the cross-attention by hand using uu.Linear.
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=self.num_heads,
-            batch_first=True,
-        )
         self.norm1 = uu.RMSNorm(d_model, eps=1e-5, include_weight=False)
         self.norm2 = uu.RMSNorm(d_model, eps=1e-5, include_weight=False)
         self.mlp = nn.Sequential(
@@ -830,8 +832,17 @@ class PARSHead(nn.Module):
             1,
             idx.unsqueeze(-1).expand(-1, -1, D),
         )  # (B*V, N, D)
-        # Skip-connection: cross-attention with sampled tokens as Q, K, V.
-        attn_out, _ = self.attn(sampled, sampled, sampled, need_weights=False)
+
+        # Hand-rolled u-μP-aware self-attention over the N sampled tokens.
+        qkv = self.qkv_proj(sampled)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        q = rearrange(q, "b n (h d) -> b h n d", h=self.num_heads)
+        k = rearrange(k, "b n (h d) -> b h n d", h=self.num_heads)
+        v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=False, scale=self._attn_scale,
+        )
+        attn_out = self.attn_out(rearrange(attn_out, "b h n d -> b n (h d)"))
         h = self.norm1(sampled + attn_out)
         h = self.norm2(h + self.mlp(h))  # (B*V, N, D)
 
