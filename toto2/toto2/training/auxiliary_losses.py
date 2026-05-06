@@ -756,10 +756,18 @@ class PARSHead(nn.Module):
         # train at an enormous effective LR and rapidly produce NaN.
         # The hand-rolled version uses :class:`uu.Linear` everywhere
         # so the optimiser applies the correct per-parameter LR scale.
+        #
+        # We additionally apply RMSNorm to ``q`` and ``k`` *before* the
+        # scaled dot product (matching the trunk's ``SelfAttention`` with
+        # ``qk_norm=True``).  Without this the post-trunk activations'
+        # magnitude growth is squared by ``q @ k^T`` and the softmax
+        # saturates, producing NaN gradients within ~150 steps.
         self.num_heads = d_model // head_dim
         self.head_dim = head_dim
         self.qkv_proj = uu.Linear(d_model, 3 * d_model, bias=True, constraint=None)
         self.attn_out = uu.Linear(d_model, d_model, bias=True, constraint=None)
+        self.q_norm = uu.RMSNorm(head_dim, eps=1e-5, include_weight=False)
+        self.k_norm = uu.RMSNorm(head_dim, eps=1e-5, include_weight=False)
         # 1/d_k scale (u-μP convention, matching SelfAttention in toto2.model).
         self._attn_scale = 1.0 / float(self.head_dim)
 
@@ -839,6 +847,8 @@ class PARSHead(nn.Module):
         q = rearrange(q, "b n (h d) -> b h n d", h=self.num_heads)
         k = rearrange(k, "b n (h d) -> b h n d", h=self.num_heads)
         v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         attn_out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=False, scale=self._attn_scale,
         )
