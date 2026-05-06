@@ -1,0 +1,154 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp36 TRIPLE: JEPA + AAMP + PARS combined.
+#
+# Stacks the three auxiliary supervision objectives that, individually
+# or pairwise, improved on the exp26 Probe F baseline:
+#
+#   * exp27 JEPA only (5500 steps): 0.182  (-0.002 vs 0.1838)
+#   * exp29 PARS only (5500 steps): 0.1845 (matches; was decreasing)
+#   * exp33 JEPA only (35000 steps): 0.175 (-0.0083)
+#   * exp34 JEPA+AAMP (30000 steps): 0.1675 (-0.0163, BEST)
+#
+# Hypothesis: if AAMP added -0.0075 on top of JEPA at 30000 steps
+# (exp33 → exp34 comparison), and PARS individually matches baseline
+# at 5500 steps with a still-decreasing trajectory, stacking all three
+# may yield val_loss ≤ 0.16 at 30000 steps.
+#
+# All three auxiliaries are conceptually orthogonal:
+#   - AAMP: changes the *encoder input* (drop high-amplitude patches)
+#   - JEPA: adds a *latent prediction* loss alongside pinball
+#   - PARS: adds a *patch-pair shift* loss on the trunk output
+#
+# So they should compose without destructive interference.  Risk: the
+# three aux gradients may collectively destabilize the trunk.
+#
+# Config: same as exp34 (winning recipe) with PARS enabled at weight=0.1.
+# All other knobs identical to exp34 for a clean controlled comparison.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp36_triple_aux
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 45                     # different from exp33 (42), exp34 (43), exp35 (44)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 27000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+
+trainer:
+  max_steps: 30000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp36_triple_aux
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp36_triple_aux_30k
+  wandb_tags:
+    - hbn
+    - mumbai_h100
+    - exp36
+    - long_run
+    - jepa
+    - aamp
+    - pars
+    - triple_combined
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp36_triple_aux
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_jepa_loss_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500
