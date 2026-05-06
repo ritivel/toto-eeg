@@ -116,6 +116,70 @@ def residual_add(
 
 
 # -------------------------------------------------------------------------
+# Magnitude-preserving residual (Karras et al., EDM2 / SDXL CONFIG D-G)
+# -------------------------------------------------------------------------
+#
+# Activation-RMS-preserving residual stream: y = (skip + α·residual) /
+# sqrt(1 + α²).  Unlike u-μP's τ-rule (which only normalizes *gradient*
+# magnitudes via scale_bwd), this normalizes *forward* activation
+# magnitudes — the FFN/attention sub-block can have any output magnitude
+# and the residual stream RMS stays bounded.
+#
+# Why we want it for the EEG/Toto2 trunk-collapse problem
+# -------------------------------------------------------
+# In exp24/25 we observed FFN weights collapsing to fp32 underflow
+# even though val_loss kept improving — the model relied entirely on the
+# scaler/output-head and the trunk drifted toward zero unchecked.
+# Magnitude-preserving residual gives the trunk a finite "magnitude
+# budget": small FFN weights translate to small residual contribution
+# but never zero out the stream.
+#
+# Notes
+# -----
+# * No learnable parameters are introduced — α is a fixed scalar
+#   (default 1.0, matching the symmetric SDXL choice).  Karras EDM2
+#   uses α=0.3 in encoder/decoder blocks, α=0.5 in the embedding;
+#   we expose ``alpha`` per-call so callers can sweep.
+# * Equivalent at α=1 to ``residual_add(residual, skip, tau=1)`` in
+#   the *forward* pass — but the gradient flow is different: here the
+#   gradient is just ``1/sqrt(1+α²)`` w.r.t. both legs (computed by
+#   autograd through the divide), with no explicit scale_bwd.  This
+#   removes one source of u-μP × FFN-shrinkage interaction.
+
+
+def mp_residual_split(
+    input: torch.Tensor, alpha: float = 1.0  # noqa: ARG001
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Identity split for magnitude-preserving residual streams.
+
+    Returns ``(residual, skip)`` both equal to ``input``. The
+    activation-magnitude bookkeeping happens entirely in
+    :func:`mp_residual_add`. We expose this as a function (instead of
+    inlining the `x_main, x_skip = x, x` line) for symmetry with
+    :func:`residual_split` and so callers can swap implementations
+    via a single config flag.
+    """
+    return input, input
+
+
+def mp_residual_add(
+    residual: torch.Tensor, skip: torch.Tensor, alpha: float = 1.0
+) -> torch.Tensor:
+    r"""Karras-style magnitude-preserving residual combine.
+
+    .. math::
+        y = \frac{\text{skip} + \alpha \cdot \text{residual}}
+                 {\sqrt{1 + \alpha^2}}
+
+    Keeps ``RMS(y) ≈ RMS(skip)`` regardless of the magnitude of
+    ``residual``, on the assumption that ``skip`` and ``residual`` are
+    approximately uncorrelated and each has unit RMS.
+    """
+    denom = (1.0 + alpha * alpha) ** 0.5
+    return (skip + alpha * residual) / denom
+
+
+# -------------------------------------------------------------------------
 # Compile-friendly gated activations
 # -------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import math
 from typing import Any, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import unit_scaling as uu
 
 from .functional import linear, per_dim_scale, rms_norm, softplus
@@ -61,6 +62,157 @@ class Linear(torch.nn.Linear):
         return linear(input, self.weight, self.bias, self.constraint, self.scale_power)
 
 
+class SigmaReparamLinear(Linear):
+    r"""u-μP-compatible σReparam Linear (Zhai et al., ICML 2023).
+
+    Forward replaces ``W`` with ``W_hat = (gamma / sigma(W)) * W`` where:
+      - ``sigma(W)`` is the spectral norm of ``W``, estimated by one
+        power-iteration step in fp32 per training step.
+      - ``gamma`` is a learnable scalar, initialized to ``sigma(W_init)``
+        so that the very first forward pass is identical to a vanilla
+        ``Linear`` (preserves u-μP forward variance at init).
+
+    Why we want it for the EEG/Toto2 trunk-collapse problem
+    -------------------------------------------------------
+    σReparam decouples the rate at which the spectral norm of ``W`` can
+    change from the dimensionality of the parameter, removing the
+    underflow path that lets AdamW + u-μP shrink FFN weights past
+    fp32 underflow (exp24 / exp25). Apple's paper shows it lets you
+    train a ViT *without* warmup, weight-decay, layer-norm, or AdamW;
+    we'll use it together with ``weight_decay=0`` (exp25 Probe C).
+
+    Implementation notes
+    --------------------
+    * The σ computation always runs in ``float32`` regardless of the
+      dtype of ``W`` — the singular-value problem is poorly conditioned
+      in bf16 and the cost is negligible (two mat-vec products).
+    * Power-iteration buffers (``u``, ``spectral_norm``) are tracked as
+      non-persistent buffers; ``gamma`` is a real ``uu.Parameter`` so
+      AdamW's u-μP scaling treats it as a per-tensor scalar (mup_type
+      ``"bias"`` -> no fan-in scaling, no weight decay if you set
+      ``independent_weight_decay``).
+    * ``stats_only=True`` records σ but does not reparametrize the
+      forward pass — useful for instrumenting an existing run without
+      changing dynamics.
+    * The reparameterization is differentiable through ``W`` because
+      we keep autograd enabled around the ``W / sigma`` op (only the
+      power-iteration update is wrapped in ``no_grad``).
+
+    Args
+    ----
+    in_features, out_features, bias, device, dtype:
+        Same as :class:`torch.nn.Linear`.
+    constraint, weight_mup_type, scale_power:
+        Same as :class:`Linear` — preserve u-μP scaling of the underlying
+        ``F.linear`` call.
+    stats_only:
+        If True, compute σ via power iteration but do **not** modify
+        the forward weight. Use this to monitor σ without changing
+        training dynamics.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Any = None,
+        dtype: Any = None,
+        constraint: Optional[str] = "to_output_scale",
+        weight_mup_type: str = "weight",
+        scale_power: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+        stats_only: bool = False,
+    ) -> None:
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            constraint=constraint,
+            weight_mup_type=weight_mup_type,
+            scale_power=scale_power,
+        )
+        self.stats_only = bool(stats_only)
+
+        # Initialize the right-singular-vector estimate ``u`` and the
+        # spectral-norm estimate σ via a short power iteration.  We
+        # deliberately do **not** use ``torch.linalg.svd`` here even
+        # though it's exact: SVD on CPU dispatches to OpenBLAS / MKL
+        # with ``num_cpus`` threads per call.  With 50+ Linear layers
+        # across N DDP ranks, that fans out to thousands of threads
+        # during model construction and effectively deadlocks the box
+        # (observed on Mumbai p5.48xlarge with Probe E pre-fix —
+        # 4 ranks × 54 layers × ~96 threads each).
+        #
+        # 8 power-iteration steps converge σ to <0.5% of the true value
+        # for d_model=384 sized matrices in our smoke tests, which is
+        # well within the precision γ needs to make the initial forward
+        # ≡ vanilla Linear.  Each step is two mat-vec products with
+        # vector inputs, so it does not trigger BLAS multi-threading
+        # at all.
+        with torch.no_grad():
+            w_fp32 = self.weight.detach().to(torch.float32)
+            u_init = torch.randn(in_features, dtype=torch.float32)
+            u_init = F.normalize(u_init, dim=0, eps=1e-12)
+            v_init = w_fp32.mv(u_init)
+            for _ in range(8):
+                v_init = w_fp32.mv(u_init)
+                v_init = F.normalize(v_init, dim=0, eps=1e-12)
+                u_init = w_fp32.t().mv(v_init)
+                u_init = F.normalize(u_init, dim=0, eps=1e-12)
+            sn_init = torch.einsum("d,dc,c->", v_init, w_fp32, u_init).detach()
+
+        # ``u`` = right-singular vector estimate, shape (in_features,)
+        self.register_buffer("u", u_init, persistent=True)
+        # Tracked spectral-norm estimate (for diagnostics / wandb).
+        self.register_buffer(
+            "spectral_norm",
+            sn_init.unsqueeze(0).clone(),
+            persistent=True,
+        )
+
+        # gamma — learnable scalar, mup_type="bias" means no fan-in LR
+        # scaling (it's a single number) and no weight-decay when
+        # ``independent_weight_decay=True``.  Initialized to σ(W_init)
+        # so the very first forward pass equals a vanilla Linear (γ/σ
+        # = 1, so W_hat = W).
+        gamma_data = sn_init.unsqueeze(0).clone()
+        self.gamma = uu.Parameter(gamma_data, mup_type="bias")
+
+    def _power_iteration_sigma(self) -> torch.Tensor:
+        """Run one power-iteration step in fp32 and return σ as a 0-d tensor."""
+        weight32 = self.weight.detach().to(torch.float32)
+        with torch.no_grad():
+            u = self.u.to(torch.float32)
+            v = weight32.mv(u)
+            v = F.normalize(v, dim=0, eps=1e-12)
+            u_new = weight32.t().mv(v)
+            u_new = F.normalize(u_new, dim=0, eps=1e-12)
+            sigma = torch.einsum("d,dc,c->", v, weight32, u_new)
+            if self.training:
+                self.u.copy_(u_new.to(self.u.dtype))
+                self.spectral_norm.copy_(sigma.detach().unsqueeze(0))
+        return sigma
+
+    def get_reparam_weight(self) -> torch.Tensor:
+        """Return ``W`` (stats_only) or ``(gamma / sigma) * W`` (default)."""
+        sigma = self._power_iteration_sigma()
+        if self.stats_only:
+            return self.weight
+        # Important: keep autograd ON for ``self.weight`` and ``self.gamma``;
+        # only ``sigma`` is detached (it's recomputed from ``self.weight``
+        # but the power iteration is no_grad).
+        scale = (self.gamma.to(torch.float32) / sigma.clamp_min(1e-12)).to(
+            self.weight.dtype
+        )
+        return scale * self.weight
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        weight = self.get_reparam_weight()
+        return linear(input, weight, self.bias, self.constraint, self.scale_power)
+
+
 class LinearReadout(Linear):
     """World-size-aware unit-scaled LinearReadout layer (final output projection).
 
@@ -94,6 +246,33 @@ class LinearReadout(Linear):
         )
 
     # Uses parent's forward() which handles scale_power
+
+
+class SigmaReparamLinearReadout(SigmaReparamLinear):
+    """σReparam variant of :class:`LinearReadout` (mup_type='output')."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Any = None,
+        dtype: Any = None,
+        constraint: Optional[str] = None,
+        weight_mup_type: str = "output",
+        stats_only: bool = False,
+    ) -> None:
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            constraint=constraint,
+            weight_mup_type=weight_mup_type,
+            scale_power=(1.0, 0.5, 0.5),
+            stats_only=stats_only,
+        )
 
 
 class RMSNorm(torch.nn.RMSNorm):

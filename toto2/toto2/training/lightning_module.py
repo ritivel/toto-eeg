@@ -227,6 +227,135 @@ class Toto2ForTraining(L.LightningModule):
             num_return_steps=num_return_steps,
         )
 
+    # ------------------------------------------------------------------
+    # Trunk-representation diagnostics (val-only)
+    # ------------------------------------------------------------------
+
+    def _capture_trunk(self):
+        """Context manager that records the **pre-out_norm** trunk activation.
+
+        Hooked on ``self.model.transformer.out_norm`` via a *pre-forward*
+        hook so we capture the residual-stream tensor *before* the final
+        RMSNorm (whose output is unit-RMS by construction and would
+        therefore make ``val_trunk_rms`` a tautology).
+
+        Why we want this
+        ----------------
+        exp24/25 showed val_loss can keep improving even as the trunk
+        weights underflow to fp32-zero — the model fell back to its
+        causal-scaler + output-head, and the transformer became a
+        no-op pass-through.  Effective rank, anisotropy, and **raw
+        residual-stream RMS** of the trunk output directly measure
+        whether the encoder is using its 384 dimensions or has
+        collapsed to a low-rank / low-magnitude subspace.
+
+        Returned object is a context manager; the captured tensor (or
+        ``None`` if no forward pass happened) is in
+        ``capture.trunk_act`` after exit.
+        """
+
+        class _Capture:
+            def __init__(self, parent_module: torch.nn.Module):
+                self._parent = parent_module
+                self._handle = None
+                self.trunk_act: Optional[torch.Tensor] = None
+
+            def _pre_hook(self, _module, inputs):
+                # ``inputs`` is the tuple ``(residual_stream,)`` about to
+                # be fed into out_norm — exactly the post-trunk pre-norm
+                # tensor we want.  We only keep the first call so
+                # multi-batch decode loops don't overwrite.
+                if self.trunk_act is None and inputs:
+                    t = inputs[0]
+                    if torch.is_tensor(t):
+                        self.trunk_act = t.detach()
+
+            def __enter__(self):
+                self._handle = self._parent.register_forward_pre_hook(self._pre_hook)
+                return self
+
+            def __exit__(self, *exc):
+                if self._handle is not None:
+                    self._handle.remove()
+                    self._handle = None
+                return False
+
+        return _Capture(self.model.transformer.out_norm)
+
+    @torch.no_grad()
+    def _log_trunk_diagnostics(self, trunk_act: torch.Tensor, batch_size: int) -> None:
+        """Effective rank, anisotropy, and RMS of the trunk output.
+
+        Parameters
+        ----------
+        trunk_act
+            Trunk output of shape ``(*lead, V, S, D)``. We flatten to
+            ``(N, D)`` where ``N = prod(lead) * V * S``.
+        batch_size
+            For Lightning's ``log(... batch_size=batch_size)`` accounting.
+        """
+        x = trunk_act.float()
+        if x.ndim < 2:
+            return
+        D = x.shape[-1]
+        x_flat = x.reshape(-1, D)
+        N = x_flat.shape[0]
+        if N < 2:
+            return
+
+        # Subsample if the batch is huge (eff-rank's SVD is O(N D^2)).
+        max_n = 4096
+        if N > max_n:
+            idx = torch.randperm(N, device=x_flat.device)[:max_n]
+            x_flat = x_flat[idx]
+            N = max_n
+
+        # Trunk RMS — direct readout of "is the encoder outputting anything?"
+        rms = x_flat.pow(2).mean().sqrt()
+
+        # Effective rank (Roy & Vetterli 2007): exp(H(s/Σs)) where s are
+        # singular values.  Bounded in [1, D]; we report the ratio to D.
+        # Center first to avoid the mean-direction dominating.
+        x_centered = x_flat - x_flat.mean(dim=0, keepdim=True)
+        try:
+            sv = torch.linalg.svdvals(x_centered)
+        except Exception:
+            return
+        sv = sv.clamp_min(1e-12)
+        p = sv / sv.sum()
+        # Shannon entropy in nats; eff-rank = exp(H).
+        h = -(p * p.log()).sum()
+        eff_rank = h.exp()
+
+        # Anisotropy — average pairwise cosine similarity of L2-normalized
+        # tokens (Ethayarajh 2019).  ~0 = uniform on the sphere; ~1 = all
+        # tokens collapse onto one direction.
+        x_norm = x_flat / x_flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        # Sample a few random pairs to keep this O(N) instead of O(N^2).
+        n_pairs = min(2048, N // 2)
+        perm_a = torch.randperm(N, device=x_flat.device)[:n_pairs]
+        perm_b = torch.randperm(N, device=x_flat.device)[:n_pairs]
+        # Avoid trivial self-pairs by shifting if collisions happen.
+        same = perm_a == perm_b
+        perm_b = torch.where(same, (perm_b + 1) % N, perm_b)
+        cos = (x_norm[perm_a] * x_norm[perm_b]).sum(dim=-1).mean()
+
+        for name, value in [
+            ("val_trunk_rms", rms),
+            ("val_trunk_eff_rank", eff_rank),
+            ("val_trunk_eff_rank_ratio", eff_rank / float(D)),
+            ("val_trunk_anisotropy", cos),
+        ]:
+            self.log(
+                name,
+                value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+
     def _step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Compute next-patch quantile loss on a collated batch.
 
@@ -263,11 +392,24 @@ class Toto2ForTraining(L.LightningModule):
 
         # Run the model on the *input* portion only — this is the same
         # forward pass that produces quantile predictions during inference.
-        outputs = self.forward(
-            target=input_target,
-            target_mask=input_mask,
-            series_ids=series_ids,
-        )
+        # At validation we also capture the post-trunk activation so we can
+        # compute effective-rank / anisotropy diagnostics; the hook is
+        # zero-cost during training (we don't enter the context manager).
+        if stage == "val":
+            with self._capture_trunk() as cap:
+                outputs = self.forward(
+                    target=input_target,
+                    target_mask=input_mask,
+                    series_ids=series_ids,
+                )
+            trunk_act = cap.trunk_act
+        else:
+            outputs = self.forward(
+                target=input_target,
+                target_mask=input_mask,
+                series_ids=series_ids,
+            )
+            trunk_act = None
         quantiles = outputs.quantiles  # (Q, B, V, n_patches, P)
         loc = outputs.loc              # (B, V, context_length)
         scale = outputs.scale          # (B, V, context_length)
@@ -336,7 +478,154 @@ class Toto2ForTraining(L.LightningModule):
                 sync_dist=True,
                 batch_size=target.shape[0],
             )
+
+            # ---------------- richer probabilistic-forecast metrics ------------
+            # Only at validation: these add ~no overhead but give us a clean
+            # signal even when val_loss is barely moving.  Motivated by the
+            # post-exp25 finding that val_loss kept improving as the FFN
+            # trunk drifted to fp32 underflow — we need metrics that can
+            # tell apart "model is genuinely calibrating" from "model is
+            # collapsing onto its causal-scaler+head fallback".
+            if stage == "val":
+                self._log_probabilistic_metrics(
+                    quantiles=quantiles,
+                    asinh_gt=asinh_gt,
+                    weights=gt_mask_per_patch,
+                    batch_size=target.shape[0],
+                )
+                if trunk_act is not None:
+                    self._log_trunk_diagnostics(
+                        trunk_act=trunk_act,
+                        batch_size=target.shape[0],
+                    )
         return loss
+
+    # ------------------------------------------------------------------
+    # Probabilistic-forecast diagnostics (val-only)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _log_probabilistic_metrics(
+        self,
+        quantiles: torch.Tensor,
+        asinh_gt: torch.Tensor,
+        weights: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Log CRPS, quantile coverage, interval coverage, MASE-proxy.
+
+        All metrics are computed in *asinh / scaled* space, the same space
+        the model is trained in.  This is faster than reversing the asinh
+        and `static_loc/scale` and — crucially — keeps the metrics on a
+        bounded scale (raw asinh-EEG can have outliers > 13 σ which dominate
+        unscaled MAE/MSE; we already saw this in v3 smoke).
+
+        We compute:
+          • ``val_crps_q``         — quantile-CRPS estimator
+            (``2/Q · Σ_τ pinball(y, ŷ_τ)``).  Same number as
+            GluonTS' ``mean_weighted_sum_quantile_loss``; close to but
+            not identical to true CRPS for finite Q.
+          • ``val_cov_50``         — empirical coverage of the 50%
+            interval ``[ŷ_0.25_lin_interp, ŷ_0.75_lin_interp]``.
+          • ``val_cov_80``         — empirical coverage of the 80%
+            interval ``[ŷ_0.1, ŷ_0.9]``.  Should be ~0.80 if the model
+            is well-calibrated; <0.80 = over-confident, >0.80 =
+            under-confident.
+          • ``val_q_cov_<τ>``      — proportion of targets below the
+            τ-quantile prediction (should ≈ τ).  Logged for τ ∈
+            ``{0.1, 0.5, 0.9}``.
+          • ``val_mae_p50``        — MAE at the median quantile,
+            scaled-asinh space.  Comparable across runs.
+          • ``val_quant_xings``    — fraction of patch positions where
+            the predicted quantiles are *not* monotone in τ.  Should
+            be ~0; a non-zero value means the head isn't learning a
+            valid CDF.
+        """
+        # quantiles: (Q, B, V, S, P), asinh_gt: (B, V, S, P), weights: (B, V, S, P)
+        Q = quantiles.shape[0]
+        levels = self.loss_fn.quantile_levels.to(quantiles.dtype).to(quantiles.device)
+        levels_view = levels.view(Q, *([1] * (quantiles.ndim - 1)))
+        w = weights.to(quantiles.dtype)
+        eps = torch.finfo(quantiles.dtype).eps
+        denom = w.sum().clamp_min(eps)
+
+        # ----- quantile-CRPS (2/Q · weighted-sum pinball) --------------------
+        errors = asinh_gt.unsqueeze(0) - quantiles  # (Q, B, V, S, P)
+        pinball = torch.maximum(levels_view * errors, (levels_view - 1.0) * errors)
+        # (2/Q) · Σ_τ pinball ≡ "weighted_sum_quantile_loss" used by GIFT-Eval.
+        per_pos_crps = pinball.sum(dim=0) * (2.0 / float(Q))  # (B, V, S, P)
+        crps = (per_pos_crps * w).sum() / denom
+
+        # ----- per-knot empirical coverage (P(y < ŷ_τ)) -----------------------
+        # Linearly comparable to τ if the model is calibrated.
+        idx_lo, idx_med, idx_hi = self._knot_indices_for(0.1, 0.5, 0.9)
+        q_lo = quantiles[idx_lo]
+        q_med = quantiles[idx_med]
+        q_hi = quantiles[idx_hi]
+        cov_q10 = ((asinh_gt < q_lo).to(quantiles.dtype) * w).sum() / denom
+        cov_q50 = ((asinh_gt < q_med).to(quantiles.dtype) * w).sum() / denom
+        cov_q90 = ((asinh_gt < q_hi).to(quantiles.dtype) * w).sum() / denom
+
+        # ----- interval coverage (P(y ∈ [ŷ_lo, ŷ_hi])) ------------------------
+        in_80 = ((asinh_gt >= q_lo) & (asinh_gt <= q_hi)).to(quantiles.dtype)
+        cov_80 = (in_80 * w).sum() / denom
+        # 50% interval requires interpolating between 0.4 and 0.6 knots
+        # (or 0.3/0.7).  We use 0.3/0.7 to keep things on actual knots.
+        idx_30, idx_70 = self._knot_indices_for(0.3, 0.7)
+        q_30 = quantiles[idx_30]
+        q_70 = quantiles[idx_70]
+        in_40 = ((asinh_gt >= q_30) & (asinh_gt <= q_70)).to(quantiles.dtype)
+        cov_40 = (in_40 * w).sum() / denom
+
+        # ----- MAE @ p50 in asinh-scaled space --------------------------------
+        mae_p50 = ((asinh_gt - q_med).abs() * w).sum() / denom
+
+        # ----- quantile crossings ---------------------------------------------
+        # Fraction of position-axes where ŷ_τ is *not* non-decreasing in τ.
+        # A trivially-collapsed head will have many crossings; a healthy
+        # head will have ~0.
+        diffs = quantiles[1:] - quantiles[:-1]  # (Q-1, B, V, S, P)
+        crossings = (diffs < 0).any(dim=0).to(quantiles.dtype)  # (B, V, S, P)
+        cross_frac = (crossings * w).sum() / denom
+
+        for name, value in [
+            ("val_crps_q", crps),
+            ("val_cov_q10", cov_q10),
+            ("val_cov_q50", cov_q50),
+            ("val_cov_q90", cov_q90),
+            ("val_cov_80", cov_80),
+            ("val_cov_40", cov_40),
+            ("val_mae_p50", mae_p50),
+            ("val_quant_xings", cross_frac),
+        ]:
+            self.log(
+                name,
+                value,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+
+    def _knot_indices_for(self, *targets: float) -> tuple[int, ...]:
+        """Return indices into ``self.loss_fn.quantile_levels`` for each target.
+
+        Targets must coincide with one of the quantile knots used by the
+        model (default ``[0.1, 0.2, …, 0.9]``).  Raises if any target is
+        outside the available knots so config drift surfaces immediately.
+        """
+        levels = self.loss_fn.quantile_levels.detach().cpu().tolist()
+        out: list[int] = []
+        for t in targets:
+            idx = min(range(len(levels)), key=lambda i: abs(levels[i] - t))
+            if abs(levels[idx] - t) > 1e-6:
+                raise ValueError(
+                    f"Knot {t!r} is not available; have {levels}. "
+                    "Probabilistic-forecast metrics need exact knot matches."
+                )
+            out.append(idx)
+        return tuple(out)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._step(batch, "train")

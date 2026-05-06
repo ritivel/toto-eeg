@@ -28,6 +28,8 @@ from ._modules import (  # noqa: F811
     LinearReadout,
     PerDimScale,
     RMSNorm,
+    SigmaReparamLinear,
+    SigmaReparamLinearReadout,
 )
 
 # functional (world-size-aware + compile-friendly)
@@ -36,6 +38,8 @@ from .functional import (  # noqa: F811
     _get_effective_batch_multiplier,
     init_world_size_cache,
     linear,
+    mp_residual_add,
+    mp_residual_split,
     per_dim_scale,
     residual_add,
     residual_split,

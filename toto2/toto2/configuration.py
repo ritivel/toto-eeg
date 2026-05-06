@@ -35,6 +35,36 @@ class Toto2ModelConfig:
     qk_norm_include_weight: Optional[bool] = None
     per_dim_scale: bool = False
     use_xpos: bool = False
+    # ----------------------------------------------------------------
+    # exp26 candidate fixes for v3 trunk-collapse (post-exp25 Probe C):
+    #
+    #   sigma_reparam      — replace every Linear with the σReparam
+    #     reparameterization ``W_hat = (γ / σ(W)) · W`` (Zhai et al.,
+    #     ICML 2023). γ initialized to σ(W_init) so the first forward
+    #     pass is identical to a vanilla Linear; one power-iteration
+    #     step in fp32 per training step. Apple's paper shows this
+    #     decouples spectral-norm growth from dimensionality and lets
+    #     a ViT train without warmup, weight decay, or LayerNorm.
+    #
+    #   mp_residual        — replace the u-μP τ-rule residual (which
+    #     normalizes only gradient magnitudes) with the Karras-style
+    #     magnitude-preserving residual ``y = (x + α·δ) / sqrt(1+α²)``,
+    #     which normalizes activation magnitudes. Removes the implicit
+    #     dependence on residual_mult / residual_attn_ratio, makes the
+    #     residual budget explicitly bounded so the FFN can have small
+    #     magnitudes intentionally without dragging the trunk RMS to 0.
+    #
+    #   mp_residual_alpha  — α in the formula above. Default 1.0
+    #     (symmetric, matches SDXL). Karras EDM2 uses α≈0.3 for
+    #     encoder/decoder blocks, α≈0.5 for the embedding network.
+    #
+    # Both flags default to False so v3 / Probe C runs are unchanged.
+    # See toto2/scripts/configs/pretrain_eeg_from_scratch_v3_probe_*
+    # for the concrete probe configurations.
+    # ----------------------------------------------------------------
+    sigma_reparam: bool = False
+    mp_residual: bool = False
+    mp_residual_alpha: float = 1.0
 
     @staticmethod
     def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
@@ -54,11 +84,18 @@ class Toto2ModelConfig:
         if self.qk_norm_include_weight is None:
             self.qk_norm_include_weight = self.norm_include_weight
         if self.residual_attn_ratio is None:
-            raise ValueError(
-                "residual_attn_ratio must be set explicitly. Use "
-                "Toto2ModelConfig.compute_residual_attn_ratio(context_length, patch_size) "
-                "to compute it."
-            )
+            if self.mp_residual:
+                # The τ-rule is unused when magnitude-preserving residual
+                # is enabled; pin to a harmless 1.0 so downstream lookups
+                # don't crash.  All actual residual scaling is done by
+                # ``mp_residual_alpha``.
+                self.residual_attn_ratio = 1.0
+            else:
+                raise ValueError(
+                    "residual_attn_ratio must be set explicitly. Use "
+                    "Toto2ModelConfig.compute_residual_attn_ratio(context_length, patch_size) "
+                    "to compute it, or enable mp_residual=True to bypass the τ-rule."
+                )
         self.num_groups = self.num_groups or self.num_heads
         self.qk_dim = self.qk_dim or self.d_model // self.num_heads
         self.v_dim = self.v_dim or self.qk_dim

@@ -51,6 +51,47 @@ __all__ = [
 
 
 # =====================================================================
+# σReparam / MP-residual helpers (exp26 — candidate trunk-collapse fix)
+# =====================================================================
+#
+# These tiny helpers funnel every "give me a Linear" / "give me a residual"
+# call through a config-aware switch so that *all* layers in Toto2Model
+# (input patch_proj, attention in/out_proj, FFN fc1/fc2, output_head) share
+# the same parameterization. Keeping the dispatch in one place ensures we
+# can never accidentally σReparam half the model.
+
+
+def _get_linear_cls(config: "Toto2ModelConfig", *, readout: bool = False):
+    """Return the Linear class to use given the σReparam config flag.
+
+    ``readout=True`` selects the u-μP readout variant
+    (``scale_power=(1.0, 0.5, 0.5)``, ``mup_type="output"``).
+    """
+    if config.sigma_reparam:
+        return uu.SigmaReparamLinearReadout if readout else uu.SigmaReparamLinear
+    return uu.LinearReadout if readout else uu.Linear
+
+
+def _resid_split(config: "Toto2ModelConfig", x: torch.Tensor, tau: float):
+    """Dispatch residual-split given the residual-mode config flag."""
+    if config.mp_residual:
+        return U.mp_residual_split(x, alpha=config.mp_residual_alpha)
+    return U.residual_split(x, tau)
+
+
+def _resid_add(
+    config: "Toto2ModelConfig",
+    residual: torch.Tensor,
+    skip: torch.Tensor,
+    tau: float,
+):
+    """Dispatch residual-add given the residual-mode config flag."""
+    if config.mp_residual:
+        return U.mp_residual_add(residual, skip, alpha=config.mp_residual_alpha)
+    return U.residual_add(residual, skip, tau)
+
+
+# =====================================================================
 # Scaler
 # =====================================================================
 
@@ -403,13 +444,14 @@ class SelfAttention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
-        self.in_proj = uu.Linear(
+        linear_cls = _get_linear_cls(config)
+        self.in_proj = linear_cls(
             config.d_model,
             config.qk_dim * config.num_heads + config.qk_dim * config.num_groups + config.v_dim * config.num_groups,
             bias=config.attn_bias,
         )
         self.qk_proj = qk_proj_layer(config.qk_dim) if qk_proj_layer is not None else None
-        self.out_proj = uu.Linear(
+        self.out_proj = linear_cls(
             config.v_dim * config.num_heads,
             config.d_model,
             bias=config.attn_bias,
@@ -482,12 +524,14 @@ class GatedLinearUnitFeedForwardNetwork(nn.Module):
         out_dim: Optional[int] = None,
         bias: bool = True,
         ffn_dropout_p: float = 0.0,
+        config: Optional["Toto2ModelConfig"] = None,
     ):
         super().__init__()
         hidden_dim = hidden_dim or self.adjust_hidden_dim(4 * in_dim)
         out_dim = out_dim or in_dim
-        self.fc1 = uu.Linear(in_dim, 2 * hidden_dim, bias=bias, constraint=None)
-        self.fc2 = uu.Linear(hidden_dim, out_dim, bias=bias, constraint=None)
+        linear_cls = _get_linear_cls(config) if config is not None else uu.Linear
+        self.fc1 = linear_cls(in_dim, 2 * hidden_dim, bias=bias, constraint=None)
+        self.fc2 = linear_cls(hidden_dim, out_dim, bias=bias, constraint=None)
         self.dropout1 = uu.Dropout(ffn_dropout_p)
         self.dropout2 = uu.Dropout(ffn_dropout_p)
 
@@ -514,31 +558,44 @@ class ResidualMLP(nn.Module):
         bias: bool = True,
         tau: float = 1.0,
         layer_type: str = "hidden",
+        config: Optional["Toto2ModelConfig"] = None,
     ):
         super().__init__()
         self.tau = tau
+        self.config = config
+        linear_hidden = _get_linear_cls(config) if config is not None else uu.Linear
+        linear_readout = (
+            _get_linear_cls(config, readout=True) if config is not None else uu.LinearReadout
+        )
 
         if layer_type == "input":
-            self.linear1 = uu.Linear(in_dim, hidden_dim, bias=bias, constraint=None)
-            self.linear2 = uu.Linear(hidden_dim, out_dim, bias=bias)
-            self.skip_proj = uu.Linear(in_dim, out_dim, bias=bias, constraint=None)
+            self.linear1 = linear_hidden(in_dim, hidden_dim, bias=bias, constraint=None)
+            self.linear2 = linear_hidden(hidden_dim, out_dim, bias=bias)
+            self.skip_proj = linear_hidden(in_dim, out_dim, bias=bias, constraint=None)
         elif layer_type == "output":
-            self.linear1 = uu.Linear(in_dim, hidden_dim, bias=bias)
-            self.linear2 = uu.LinearReadout(hidden_dim, out_dim, bias=bias)
-            self.skip_proj = uu.LinearReadout(in_dim, out_dim, bias=bias)
+            self.linear1 = linear_hidden(in_dim, hidden_dim, bias=bias)
+            self.linear2 = linear_readout(hidden_dim, out_dim, bias=bias)
+            self.skip_proj = linear_readout(in_dim, out_dim, bias=bias)
         else:
-            self.linear1 = uu.Linear(in_dim, hidden_dim, bias=bias)
-            self.linear2 = uu.Linear(hidden_dim, out_dim, bias=bias)
-            self.skip_proj = uu.Linear(in_dim, out_dim, bias=bias)
+            self.linear1 = linear_hidden(in_dim, hidden_dim, bias=bias)
+            self.linear2 = linear_hidden(hidden_dim, out_dim, bias=bias)
+            self.skip_proj = linear_hidden(in_dim, out_dim, bias=bias)
 
         self.dropout = uu.Dropout(dropout_p)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_main, x_skip = U.residual_split(x, self.tau)
-        h = U.silu(self.linear1(x_main))
-        h = self.dropout(self.linear2(h))
-        skip = self.skip_proj(x_skip)
-        return U.residual_add(h, skip, self.tau)
+        if self.config is not None and self.config.mp_residual:
+            x_main, x_skip = U.mp_residual_split(x, alpha=self.config.mp_residual_alpha)
+            h = U.silu(self.linear1(x_main))
+            h = self.dropout(self.linear2(h))
+            skip = self.skip_proj(x_skip)
+            return U.mp_residual_add(h, skip, alpha=self.config.mp_residual_alpha)
+        else:
+            x_main, x_skip = U.residual_split(x, self.tau)
+            h = U.silu(self.linear1(x_main))
+            h = self.dropout(self.linear2(h))
+            skip = self.skip_proj(x_skip)
+            return U.residual_add(h, skip, self.tau)
 
 
 class InputResidualMLP(ResidualMLP):
@@ -580,6 +637,7 @@ class SelfAttentionTransformerLayer(nn.Module):
             out_dim=None,
             bias=config.mlp_bias,
             ffn_dropout_p=config.dropout_p,
+            config=config,
         )
         self.norm1 = uu.RMSNorm(config.d_model, eps=config.norm_eps, include_weight=config.norm_include_weight)
         self.norm2 = uu.RMSNorm(config.d_model, eps=config.norm_eps, include_weight=config.norm_include_weight)
@@ -601,13 +659,13 @@ class SelfAttentionTransformerLayer(nn.Module):
         seq_ids: Optional[Int[torch.Tensor, "... seq"]] = None,
         **kwargs,
     ) -> Float[torch.Tensor, "... seq_len dim"]:
-        x, skip = U.residual_split(x, self.attn_tau)
+        x, skip = _resid_split(self.config, x, self.attn_tau)
         x = self.attn(self.norm1(x), seq_ids, **kwargs)
-        x = U.residual_add(self.attn_resid_dropout(x), skip, self.attn_tau)
+        x = _resid_add(self.config, self.attn_resid_dropout(x), skip, self.attn_tau)
 
-        x, skip = U.residual_split(x, self.mlp_tau)
+        x, skip = _resid_split(self.config, x, self.mlp_tau)
         x = self.ffn(self.norm2(x))
-        return U.residual_add(self.mlp_resid_dropout(x), skip, self.mlp_tau)
+        return _resid_add(self.config, self.mlp_resid_dropout(x), skip, self.mlp_tau)
 
 
 class VariateTimeTransformerDecoder(nn.Module):
@@ -895,6 +953,7 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
             out_dim=config.d_model,
             dropout_p=config.dropout_p,
             bias=True,
+            config=config,
         )
         self.transformer = VariateTimeTransformerDecoder(
             config,
@@ -909,6 +968,7 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
                 out_dim=out_dim,
                 dropout_p=config.dropout_p,
                 bias=True,
+                config=config,
             )
 
         self.output_head = QuantileKnotsOutputHead(
