@@ -924,6 +924,13 @@ class Toto2ForTraining(L.LightningModule):
         super().setup(stage)
         try:
             uu.cache_fan_values(self.model.named_parameters())
+            # The auxiliary heads are u-μP-aware (uu.Linear / uu.RMSNorm)
+            # so they need fan-value caching too — otherwise the optimiser
+            # would fall back to fan-naive LR scaling for their params.
+            if self.jepa_head is not None:
+                uu.cache_fan_values(self.jepa_head.named_parameters())
+            if self.pars_head is not None:
+                uu.cache_fan_values(self.pars_head.named_parameters())
         except Exception:
             # If running without unit-scaling-tagged params, optimizer falls
             # back to standard scaling. We tolerate this for compatibility.
@@ -952,7 +959,18 @@ class Toto2ForTraining(L.LightningModule):
             )
 
     def configure_optimizers(self):
+        # Trainable parameters live under (a) the trunk model, (b) the
+        # auxiliary heads' *online* sides (projector, predictor, PARS, MR-STFT
+        # — each only present if its config flag is enabled).  The JEPA
+        # *target* tower lives inside ``jepa_head`` but its params are
+        # ``requires_grad=False`` so the filter naturally excludes them.
         params = [p for p in self.model.parameters() if p.requires_grad]
+        if self.jepa_head is not None:
+            params.extend(p for p in self.jepa_head.parameters() if p.requires_grad)
+        if self.pars_head is not None:
+            params.extend(p for p in self.pars_head.parameters() if p.requires_grad)
+        if self.mrstft_loss is not None:
+            params.extend(p for p in self.mrstft_loss.parameters() if p.requires_grad)
 
         if self.optimizer_name == "adamw":
             optimizer = uu.AdamW(

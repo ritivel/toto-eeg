@@ -91,11 +91,13 @@ training:
   auxiliary:
     jepa:
       enabled: true
-      weight: 0.5             # lambda_jepa
-      sigreg_weight: 0.02     # lambda_sigreg (LeJEPA's lambda x SIGReg)
+      weight: 0.1             # lambda_jepa — small to avoid swamping pinball
+      sigreg_weight: 0.01     # lambda_sigreg — LeJEPA-paper-default-scale
       proj_dim: 256
-      ema_tau: 0.999
-      sigreg_num_slices: 1024
+      ema_tau: 0.99           # tighter than 0.999; for 5500-step smokes the
+                              # EMA needs to track online faster than the
+                              # 1k-step horizon 0.999 implies.
+      sigreg_num_slices: 256
       sigreg_n_quad_points: 17
 
 trainer:

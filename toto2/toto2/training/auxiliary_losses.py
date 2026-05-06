@@ -51,6 +51,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+import dd_unit_scaling as uu
+
 
 # =====================================================================
 # B. AAMP: Amplitude-aware patch masking (NeurIPT, arXiv:2510.16548)
@@ -283,6 +285,7 @@ def sigreg_loss(
     n_quad_points: int = 17,
     sigma: float = 1.0,
     global_step: int = 0,
+    max_samples: Optional[int] = 4096,
 ) -> torch.Tensor:
     """SIGReg with the Epps-Pulley characteristic-function statistic.
 
@@ -311,6 +314,14 @@ def sigreg_loss(
         same directions (sync sampling).  Using the trainer
         ``global_step`` makes the directions evolve over training so
         the regulariser does not memorise a fixed projection.
+    max_samples
+        If ``N > max_samples`` we randomly subsample to keep memory
+        bounded.  The intermediate ``(n_quad, N, num_slices)`` tensor
+        is the dominant cost: 17 * 99K * 1024 * 4 bytes ≈ 7GB on
+        Toto-2's full (B=12, V=129, S=64) flattened context.  4096
+        samples gives ~70MB and is more than enough for the
+        Cramér-Wold sketch (LeJEPA paper §4.3).  Set to ``None`` to
+        disable subsampling.
 
     Returns
     -------
@@ -319,6 +330,15 @@ def sigreg_loss(
     """
     if embeddings.dim() != 2:
         raise ValueError(f"SIGReg expects (N, K); got {tuple(embeddings.shape)}")
+    N_full, K = embeddings.shape
+
+    # Subsample for memory.  We do this *with* gradient (it's just an index
+    # gather) so SIGReg still trains the encoder.
+    if max_samples is not None and N_full > int(max_samples):
+        g_sub = torch.Generator(device="cpu")
+        g_sub.manual_seed(int(global_step) * 31 + 17)  # different seed than slice sampling
+        idx = torch.randperm(N_full, generator=g_sub)[: int(max_samples)].to(embeddings.device)
+        embeddings = embeddings.index_select(0, idx)
     N, K = embeddings.shape
     device = embeddings.device
 
@@ -430,24 +450,38 @@ class JEPAHead(nn.Module):
         self.sigreg_num_slices = int(sigreg_num_slices)
         self.sigreg_n_quad_points = int(sigreg_n_quad_points)
 
-        # Projector: 2-hidden-layer MLP with batch norm (LeJEPA recipe).
-        # Note: BatchNorm under DDP averages within each rank only by default;
-        # for our smoke-scale runs that's fine.
+        # Projector: 2-hidden-layer MLP using u-μP-aware Linear + RMSNorm.
+        # We **do not** use BatchNorm here:
+        #
+        #   1. Under DDP, BatchNorm only averages within each rank, so the
+        #      stats it produces are per-rank — fine for image SSL where
+        #      every rank sees the same distribution but suspect for our
+        #      EEG corpus which has very different stats across recordings.
+        #   2. The trunk + projector + predictor all use base_lr=0.3 (the
+        #      u-μP-balanced trunk LR).  ``nn.Linear`` does not carry mup
+        #      metadata, so the optimizer would apply this LR raw — far
+        #      too high for fan_in=256 where the unit-scaled LR should be
+        #      ~0.3/sqrt(256) = 0.019.  ``uu.Linear`` carries the correct
+        #      mup_type='weight' tag.
+        #   3. RMSNorm + uu.Linear is exactly the projector pattern used
+        #      in LeJEPA-MINIMAL (see vendor/lejepa/lejepa/__init__.py
+        #      and the paper §5.1 ablation showing RMSNorm matches BN
+        #      for ViT-class projectors at our scale).
         self.projector = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.BatchNorm1d(4 * d_model),
+            uu.Linear(d_model, 4 * d_model, bias=True, constraint=None),
+            uu.RMSNorm(4 * d_model, eps=1e-5, include_weight=False),
             nn.GELU(),
-            nn.Linear(4 * d_model, 4 * d_model),
-            nn.BatchNorm1d(4 * d_model),
+            uu.Linear(4 * d_model, 4 * d_model, bias=True, constraint=None),
+            uu.RMSNorm(4 * d_model, eps=1e-5, include_weight=False),
             nn.GELU(),
-            nn.Linear(4 * d_model, proj_dim),
+            uu.Linear(4 * d_model, proj_dim, bias=True, constraint=None),
         )
 
-        # Predictor: one-hidden-layer MLP (small).
+        # Predictor: one-hidden-layer MLP, also u-μP-compliant.
         self.predictor = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim),
+            uu.Linear(proj_dim, proj_dim, bias=True, constraint=None),
             nn.GELU(),
-            nn.Linear(proj_dim, proj_dim),
+            uu.Linear(proj_dim, proj_dim, bias=True, constraint=None),
         )
 
         # EMA target — created lazily by setup_target so it inherits the
@@ -456,6 +490,26 @@ class JEPAHead(nn.Module):
         self._target_scaler: Optional[nn.Module] = None
         self._target_patch_proj: Optional[nn.Module] = None
         self._target_projector: Optional[nn.Module] = None
+
+    def train(self, mode: bool = True):
+        """Override to keep the EMA target tower in eval mode regardless.
+
+        Lightning calls ``self.train(True)`` at the start of every
+        training epoch which would normally toggle every submodule's
+        ``training`` flag.  For the EMA target tower we always want
+        ``eval()`` semantics — BatchNorm should read its EMA-updated
+        running stats, not compute fresh batch stats.
+        """
+        super().train(mode)
+        for tower in (
+            self._target_trunk,
+            self._target_scaler,
+            self._target_patch_proj,
+            self._target_projector,
+        ):
+            if tower is not None:
+                tower.eval()
+        return self
 
     def setup_target(
         self,
@@ -471,11 +525,16 @@ class JEPAHead(nn.Module):
         sync them.  We deliberately **do not** add the target params to
         the optimiser — they get no gradients and are updated manually
         in ``update_ema``.
+
+        We also force the target tower into ``eval`` mode so its
+        BatchNorm reads its (EMA-updated) running stats instead of
+        computing fresh batch stats — those would be doubly stochastic
+        and noisy.
         """
-        self._target_scaler = copy.deepcopy(scaler)
-        self._target_patch_proj = copy.deepcopy(patch_proj)
-        self._target_trunk = copy.deepcopy(trunk)
-        self._target_projector = copy.deepcopy(self.projector)
+        self._target_scaler = copy.deepcopy(scaler).eval()
+        self._target_patch_proj = copy.deepcopy(patch_proj).eval()
+        self._target_trunk = copy.deepcopy(trunk).eval()
+        self._target_projector = copy.deepcopy(self.projector).eval()
         for p in self._target_scaler.parameters():
             p.requires_grad_(False)
         for p in self._target_patch_proj.parameters():
@@ -558,10 +617,9 @@ class JEPAHead(nn.Module):
             & (reduce(cpm_mask, "... (s p) -> ... s", "prod", p=patch_size) == 1)
         ] = -1
         x = self._target_trunk(x, group_ids=group_ids)
-        # Project through the (also EMA'd) projector — flatten leading axes
-        # because BatchNorm1d wants a 2-D input.
-        leading = x.shape[:-1]
-        x = self._target_projector(x.reshape(-1, x.shape[-1])).reshape(*leading, self.proj_dim)
+        # Project through the (also EMA'd) projector — uu.RMSNorm /
+        # uu.Linear both work on (..., D) so no flatten is needed.
+        x = self._target_projector(x)
         return x
 
     def forward(
@@ -598,13 +656,11 @@ class JEPAHead(nn.Module):
                 f"projector in_features {self.projector[0].in_features}"
             )
 
-        leading = context_trunk_act.shape[:-1]
-        # Project online context: (B, V, S, proj_dim)
-        proj_context = self.projector(context_trunk_act.reshape(-1, context_trunk_act.shape[-1]))
-        proj_context = proj_context.reshape(*leading, self.proj_dim)
-
+        # Project online context: (B, V, S, proj_dim).  uu.Linear and
+        # uu.RMSNorm both work on (..., D) so no flatten is needed.
+        proj_context = self.projector(context_trunk_act)
         # Predict next-patch latents.
-        pred_next = self.predictor(proj_context.reshape(-1, self.proj_dim)).reshape(*leading, self.proj_dim)
+        pred_next = self.predictor(proj_context)
 
         # Get EMA target latents for the same input.
         target_lat = self._target_forward(
@@ -696,22 +752,26 @@ class PARSHead(nn.Module):
         self.head_dim = head_dim
 
         # Cross-attention: tokens (Q) attend to all sampled tokens (K, V).
+        # nn.MultiheadAttention's internal Linear layers are not u-μP-aware
+        # but the head is small (~1 layer) and we weight it 0.1, so the
+        # mismatch is bounded.  An option for v2 of this probe is to
+        # implement the cross-attention by hand using uu.Linear.
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=self.num_heads,
             batch_first=True,
         )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = uu.RMSNorm(d_model, eps=1e-5, include_weight=False)
+        self.norm2 = uu.RMSNorm(d_model, eps=1e-5, include_weight=False)
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_hidden),
+            uu.Linear(d_model, mlp_hidden, bias=True, constraint=None),
             nn.GELU(),
-            nn.Linear(mlp_hidden, d_model),
+            uu.Linear(mlp_hidden, d_model, bias=True, constraint=None),
         )
 
         # Pairwise embedding -> scalar shift.
-        self.pair_proj = nn.Linear(2 * d_model, mlp_hidden)
-        self.shift_head = nn.Linear(mlp_hidden, 1)
+        self.pair_proj = uu.Linear(2 * d_model, mlp_hidden, bias=True, constraint=None)
+        self.shift_head = uu.Linear(mlp_hidden, 1, bias=True, constraint=None)
 
     def forward(
         self,
