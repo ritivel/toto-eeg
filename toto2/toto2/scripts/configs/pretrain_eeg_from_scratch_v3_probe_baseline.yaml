@@ -1,0 +1,131 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — v3 PROBE A: trajectory baseline (extended smoke). 2026-05-06.
+#
+# Purpose: exp23's smoke run (2500 steps) showed FFN trunk weights shrinking
+# ~50% per 1000 steps between step 1500–2500. Naive exponential extrapolation
+# put weights below the fp32 residual-precision threshold (~6e-8) by step
+# ~17k of the planned 90k long run. With only 2 weight_inspect datapoints
+# we can't tell whether (a) the shrinkage rate is decelerating toward a
+# stable equilibrium or (b) it stays exponential and the long run will
+# functionally lose its trunk before completing.
+#
+# This config is identical to `pretrain_eeg_from_scratch_v3_smoke.yaml`
+# except for:
+#   - max_steps     2500 -> 5500   (1.5x longer than what we already saw)
+#   - stable_steps  2000 -> 5000
+#   - val_check_interval 200 -> 500 (less val noise per check)
+#   - save_top_k       2 -> -1     (KEEP EVERY checkpoint for trajectory)
+#   - output_dir / wandb names retitled to "probe_baseline"
+#
+# Companion: pretrain_eeg_from_scratch_v3_probe_robust.yaml runs in
+# parallel with the same schedule but adds standardize_robust_per_channel
+# and gradient_clip_val=5.0 — tests whether raw-EEG outliers are the
+# *cause* of FFN shrinkage. base_lr stays at 0.3 in both probes so the
+# manipulation is the data + clip, not the LR.
+#
+# Wall-clock estimate on 4xH100 SXM5 fp32: ~1.7 it/s -> ~54 minutes.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_probe_baseline
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_probe_baseline
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_v3_probe_baseline_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - probe
+    - baseline
+    - exp24
+    - trajectory
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_probe_baseline
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500

@@ -1,0 +1,134 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — v3 PROBE D (exp25): base_lr = 0.05 (6x lower). 2026-05-06.
+#
+# exp24 confirmed the FFN trunk fully collapses to fp32-equivalent zero
+# by step ~4000 with base_lr=0.3, regardless of robust per-channel transform
+# or looser grad clip.
+#
+# Probe D tests whether AdamW step magnitude alone drives the collapse.
+# AdamW per-parameter update magnitude is approximately `lr * mup_scale`
+# (independent of grad magnitude in steady state due to m_hat / sqrt(v_hat)
+# normalization). At base_lr=0.3 with u-uP scaling 1/sqrt(384)/sqrt(12)
+# the median trunk effective LR is ~4.4e-3 per step.
+#
+# Lowering base_lr 6x to 0.05 brings effective trunk LR down to ~7e-4.
+# If shrinkage rate scales linearly with LR, the step-4000 collapse
+# should move out to step ~24000 (still inside our 5500-step probe? no,
+# but at step 5500 we should be at fc2 RMS ~5e-3, not ~1e-36).
+#
+# Decision rule:
+# - If FFN min RMS at step 5500 stays above ~1e-3 -> LR is the driver, the
+#   long v3 should use base_lr <= 0.05.
+# - If FFN still collapses -> the gradient sign bias is so strong that
+#   even at low LR it eventually wins. Need optimizer-level fix.
+#
+# Identical to pretrain_eeg_from_scratch_v3_probe_baseline.yaml except:
+#   - base_lr: 0.3 -> 0.05
+#   - min_lr:  1.5e-2 -> 2.5e-3 (5% of base_lr)
+# weight_decay stays at 1e-3 (same as Probe A) so the manipulation is
+# unambiguous: only LR changes.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_probe_lowlr
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.05                          # was 0.3 in Probe A; THE manipulation
+  min_lr: 2.5e-3                         # 5% of base_lr (MiniCPM convention)
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_probe_lowlr
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_v3_probe_lowlr_5500steps_baselr0.05
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - probe
+    - lowlr
+    - exp25
+    - trajectory
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_probe_lowlr
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500

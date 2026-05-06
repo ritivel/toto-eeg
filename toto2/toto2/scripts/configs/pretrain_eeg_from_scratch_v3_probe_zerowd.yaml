@@ -1,0 +1,123 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — v3 PROBE C (exp25): weight_decay = 0. 2026-05-06.
+#
+# exp24 confirmed the FFN trunk fully collapses to fp32-equivalent zero
+# (~1.5e-36) by step ~4000, regardless of robust per-channel transform
+# or looser grad clip. Attention does NOT collapse; only the FFN dies.
+# Val_loss keeps improving through the collapse.
+#
+# Probe C tests whether explicit weight_decay is the proximal driver.
+# This config is IDENTICAL to pretrain_eeg_from_scratch_v3_probe_baseline.yaml
+# except `weight_decay: 1.0e-3 -> 0.0`. Everything else is held constant
+# so the manipulation is unambiguous.
+#
+# Decision rule:
+# - If FFN min RMS plateaus above ~1e-3 by step 5500 -> weight_decay is the
+#   proximal driver, the long v3 should set wd=0.
+# - If FFN still collapses to ~1e-36 -> the gradient updates THEMSELVES
+#   are the driver (not weight_decay), need optimizer-level fix (NorMuon).
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_probe_zerowd
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0                       # was 1e-3 in Probe A; THE manipulation
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_probe_zerowd
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_v3_probe_zerowd_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - probe
+    - zero_weight_decay
+    - exp25
+    - trajectory
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_probe_zerowd
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500

@@ -1,0 +1,137 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — v3 PROBE B: outlier-mitigated. 2026-05-06.
+#
+# Purpose: companion to probe_baseline. Tests whether the raw-EEG outliers
+# are the *cause* of the FFN shrinkage observed in exp23's smoke run.
+# Asinh-scaled targets in the smoke run had min=-13.45 / max=+9.21 \u2014
+# heavy tails caused by line noise, eye blinks, etc. that the dropped
+# `standardize_per_channel` was masking. The pre-clip global grad L2
+# was 1.59e+14, dominated by patch_proj.*bias outliers; gradient_clip_val=
+# 1.0 contained it but at the cost of squashing genuine signal.
+#
+# Two changes vs probe_baseline:
+#   1. transform: { type: standardize_robust_per_channel }
+#      Median/MAD per-channel normalization. Acausal (uses full window)
+#      but robust to outliers, unlike mean/std. Tames the heavy tails
+#      before they hit PatchedCausalStdScaler. Weaker acausal-leak than
+#      mean/std because the median is dominated by typical values, not
+#      by outliers.
+#   2. gradient_clip_val: 1.0 -> 5.0
+#      With outliers tamed, we don't need such an aggressive clip. Lets
+#      more genuine-signal gradient through the optimizer.
+#
+# base_lr stays at 0.3 (same as smoke and probe_baseline) so the
+# manipulation is the data + clip, not the LR.
+#
+# Decision rule (for the long v3 recipe):
+#   - If A keeps decaying and B plateaus -> long v3 adopts these mitigations.
+#   - If A and B both decay -> need more aggressive mitigation (lower
+#     base_lr, switch to NorMuon).
+#   - If A and B both plateau -> the smoke shrinkage was a transient and
+#     the long v3 is safe with the smoke recipe.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_probe_robust
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: standardize_robust_per_channel   # mitigation #1
+
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 5.0                     # mitigation #2 (was 1.0)
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_probe_robust
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_v3_probe_robust_5500steps_mad_clip5
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - probe
+    - robust_transform
+    - clip5
+    - exp24
+    - trajectory
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_probe_robust
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500
