@@ -1,0 +1,216 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — pre-train from scratch on EEG, V3 RECIPE (2026-W19).
+#
+# Applies fixes (1), (2), (3) from the experiment-22 deep-dive — the
+# three changes the v2.1 post-mortem identified as required to make
+# the trunk actually learn. v2.1's headline val_loss=0.219 (better than
+# the 0.27 optimal-Gaussian floor) was achieved with FFN weights at
+# bf16 underflow (~1e-37) and attention shrunk ~1000x from init: the
+# 22M model had decayed into a smart `causal_z_score + bias + identity-
+# attention + output_head` predictor and was wasting most of its
+# parameters. v3 targets the three structural causes.
+#
+# WHY THE TRUNK COLLAPSED IN v2.1
+#
+#   (a) `residual_attn_ratio = sqrt(S/log(S)) ≈ 5.14` from Toto-2.0's
+#       auto-derivation puts mlp_tau ~5–7x weaker than attn_tau, so
+#       FFN gradients live below the noise floor from step 0.
+#   (b) `precision: bf16-mixed` casts forward computation to bf16, and
+#       any weight magnitude < 1.18e-38 (bf16's smallest normal) rounds
+#       to 0 in the matmul — even though the fp32 master copy still
+#       holds the small value. Activations through that layer go to 0,
+#       gradients go to 0, the weight stays small, repeat.
+#   (c) `weight_decay = 0.01` keeps nudging unused weights toward 0
+#       with no offsetting learning signal, so weights that started
+#       near init magnitude get pushed past the bf16 underflow line.
+#
+# v3 CHANGES vs. v2.1
+#
+#   (1a) precision         bf16-mixed  -> 32-true
+#        Eliminates the forward-cast rounding so any fp32 weight
+#        magnitude (down to ~1.4e-45) stays productive in the matmul.
+#        ~1.6–1.8x slower per step on 4xH100 SXM5 80GB; still well
+#        within memory budget at d_model=384, batch=16, ctx=4096.
+#   (1c) weight_decay      0.01        -> 1.0e-3
+#        Defense-in-depth on (c). 10x lighter shrinkage; unused
+#        weights drift toward 0 ~10x slower, leaving the optimizer
+#        an order of magnitude more time to discover their use.
+#   (2a) residual_mult     0.75        -> 1.0
+#   (2b) residual_attn_ratio null      -> 1.0
+#        Stops auto-deriving Toto-2's 5.14 default and pins the
+#        residual rule to a u-uP-balanced setting. mlp_tau goes
+#        from ~0.06 to ~0.27, comparable to attn_tau, so FFN
+#        gradients are no longer 1/30 the size of attention's.
+#        u-uP empirical optimum is 0.25 (Blake et al. 2024 ICLR
+#        Spotlight); we pick 1.0 as a safer interior point in their
+#        recommended sweep range eta in [0.5, 8] and re-validate
+#        with lr_probe.py before committing to a long run.
+#   (3)  transform         standardize_per_channel -> none
+#        Drops the acausal full-window per-channel z-score in
+#        eeg_builder.py. The model's PatchedCausalStdScaler does
+#        the same job correctly (causally, per-patch) inside the
+#        forward; the outer transform was both redundant AND leaked
+#        future statistics into the past. Raw EEG amplitudes (~50–
+#        200 µV) are perfectly fine input for the in-model scaler.
+#
+# WHAT WAS KEPT FROM v2.1
+#   - base_lr=0.3 (lr_probe-validated; re-run lr_probe.py before
+#     committing — the residual rebalance may shift the sweet spot
+#     by ~1.5–2x in either direction).
+#   - WSD schedule (4000 warmup / 80000 stable / 8000 decay)
+#   - huber_kappa=0.05
+#   - gradient_clip_val=1.0
+#   - knot-spread logging (added in v2.1's lightning_module.py).
+#
+# OPEN ITEMS NOT ADDRESSED HERE (see exp22 page priority list)
+#   4. Channel embeddings — all 129 electrodes still share one
+#      series_id. Largest remaining hit on motor-imagery / emotion.
+#   5. LaBraM-style preprocessing (band-pass / notch / 200 Hz).
+#   6. CRPS / coverage / per-subject loss histogram.
+#   7. Ridge-probe-default in OEB.
+#
+# COMPANION CONFIGS
+#   - pretrain_eeg_from_scratch_v3_normuon.yaml — NorMuon variant.
+#     Still blocked on the split-optimizer change in
+#     Toto2ForTraining.configure_optimizers; see that file's header.
+#
+# Continue-pretraining from a published Datadog/Toto-2.0-* checkpoint is
+# NOT supported. The v1 continue run lobotomised the pretrained init in
+# under 10k steps; we don't intend to revisit that path. For zero-shot
+# evaluation against a Datadog checkpoint use Toto2Model.from_pretrained
+# directly (e.g. through the open-eeg-bench adapter at toto2/eval).
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3
+
+# --------------------------------------------------------------------
+# Model — u-uP-balanced residual rule (fix #2)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0                # was 0.75 (fix #2)
+  residual_attn_ratio: 1.0          # was null (auto-derived to 5.14, fix #2).
+                                    # Pin explicitly so the helper in
+                                    # Toto2ModelConfig.compute_residual_attn_ratio
+                                    # can never silently re-introduce 5.14.
+
+# --------------------------------------------------------------------
+# Data — drop the acausal per-channel z-score (fix #3)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none                    # was standardize_per_channel (fix #3).
+                                    # PatchedCausalStdScaler does the per-
+                                    # channel z-score causally and per-patch
+                                    # inside the model — the outer transform
+                                    # was redundant AND acausal.
+
+# --------------------------------------------------------------------
+# Training — fp32 master + lighter weight decay (fix #1)
+# --------------------------------------------------------------------
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3                      # carried over from v2.1; re-validate
+                                    # via lr_probe.py after architecture
+                                    # change. Effective trunk LR after
+                                    # 1/sqrt(384) * 1/sqrt(12) scaling is
+                                    # ~4.4e-3, comfortably above the AdamW
+                                    # noise floor and below v2.1's empirical
+                                    # divergence onset (~0.4 effective).
+  min_lr: 1.5e-2                    # 5% of base_lr (MiniCPM convention)
+  warmup_steps: 2000
+  stable_steps: 80000
+  decay_steps: 8000
+  weight_decay: 1.0e-3              # was 0.01 (fix #1c). 10x lighter
+                                    # shrinkage protects rebalanced FFN
+                                    # weights while they discover their
+                                    # use during early training.
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false                    # always-off while diagnosing v3
+  matmul_precision: high
+
+trainer:
+  max_steps: 90000
+  accumulate_grad_batches: 1
+  precision: 32-true                # was bf16-mixed (fix #1a). Removes
+                                    # the bf16 forward cast that rounded
+                                    # any weight < 1.18e-38 to 0 in matmul.
+                                    # ~1.6-1.8x slower per step but the
+                                    # 22M model still fits at batch 16.
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 2
+  refresh_rate: 50
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_from_scratch_22m_v3_fp32_balanced_residual_no_double_norm
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - fp32
+    - balanced_residual
+    - no_double_norm
+    - lr0.3
+    - knot_spread
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 2000

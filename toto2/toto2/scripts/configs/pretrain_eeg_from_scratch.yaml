@@ -104,7 +104,7 @@ trainer:
   num_sanity_val_steps: 2
   refresh_rate: 50
   accelerator: gpu
-  devices: 4                        # 4 H100s for from-scratch; the other 4 run continued
+  devices: 4                        # 4 H100s for from-scratch
   strategy: ddp_find_unused_parameters_false
 
 logging:

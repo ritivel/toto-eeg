@@ -1,0 +1,124 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — pre-train from scratch on EEG, NorMuon variant.
+#
+# **STATUS (2026-W19): NOT FUNCTIONAL OUT-OF-THE-BOX.**
+#
+# `dd_unit_scaling.NorMuon` (which wraps `dion.NorMuon`) only supports
+# matrix-shaped weight parameters. Toto 2.0 has plenty of non-matrix
+# parameters (RMSNorm scalars, biases, scalar tau buffers, etc.) and
+# the current `Toto2ForTraining.configure_optimizers` puts ALL params
+# through one optimizer.  Running this config raises:
+#
+#     AssertionError: NorMuon optimizer only supports matrix parameters.
+#
+# To make this work the LightningModule needs a Karpathy-nanochat-style
+# split-optimizer design: one `dd_unit_scaling.AdamW` for biases /
+# norms / scalars, one `dd_unit_scaling.NorMuon` for matrix weights.
+# Both then call `step()` and `zero_grad()` together. See:
+#   - https://github.com/karpathy/nanochat/blob/main/nanochat/optim.py
+#   - dd_unit_scaling/README.md "Optimizers" section (lines 41-49)
+#
+# Until that change lands, USE `pretrain_eeg_from_scratch_v2.yaml`
+# (AdamW + base_lr=1.0). AdamW with the corrected base_lr already
+# pulls the loss from 0.44 stuck -> 0.16 in 200 steps on a smoke
+# run — there's no urgency to switch to NorMuon for the first relaunch.
+#
+# This config is preserved as a future-work template. The numbers below
+# are the recommended starting point ONCE the split-optimizer lands.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_normuon
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 0.75
+  residual_attn_ratio: null
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: standardize_per_channel
+
+training:
+  seed: 42
+  optimizer: normuon                # was adamw
+  base_lr: 2.0e-2                   # Muon-class LR; standard for u-µP NorMuon
+  min_lr: 1.0e-3
+  warmup_steps: 2000
+  stable_steps: 80000
+  decay_steps: 8000
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 90000
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0            # NorMuon also benefits from clipping
+  log_every_n_steps: 50
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 2
+  refresh_rate: 50
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_normuon
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_from_scratch_22m_v3_normuon_lr2e-2
+  wandb_tags: [hbn, from_scratch, mumbai_h100, v3, normuon, lr2e-2, no_compile, knot_spread]
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_normuon
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 5000

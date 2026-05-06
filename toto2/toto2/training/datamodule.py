@@ -3,7 +3,7 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/)
 # Copyright 2026 Datadog, Inc.
 
-"""LightningDataModule for Toto 2.0 pre-training and continued pre-training.
+"""LightningDataModule for Toto 2.0 pre-training.
 
 Wraps a pair of ``Dataset`` instances (train + optional validation) into a
 Lightning-native pipeline with proper sharding-aware DataLoaders.

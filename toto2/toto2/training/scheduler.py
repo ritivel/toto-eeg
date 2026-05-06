@@ -14,9 +14,7 @@ has three phases:
 3. **Decay** — ``1 - sqrt(progress)`` annealing from ``base_lr`` down to
    ``min_lr`` over ``decay_steps``.
 
-Beyond ``warmup + stable + decay`` the LR stays at ``min_lr``. The same shape
-is used for both pre-training and continued pre-training; only phase lengths
-typically change.
+Beyond ``warmup + stable + decay`` the LR stays at ``min_lr``.
 """
 
 from __future__ import annotations

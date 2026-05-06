@@ -1,0 +1,148 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — v3 SMOKE / VERIFICATION RUN (2026-05-06).
+#
+# This is a short (~2500-step) version of pretrain_eeg_from_scratch_v3.yaml
+# whose ONLY purpose is to verify the v3 structural fixes work end-to-end
+# on the AWS box BEFORE committing to a long run:
+#
+#   (1)  precision: 32-true        — eliminates bf16 forward-cast underflow
+#   (1c) weight_decay: 1.0e-3      — defense-in-depth on (c) from exp22
+#   (2)  residual_mult: 1.0,
+#        residual_attn_ratio: 1.0  — u-uP-balanced; mlp_tau ≈ 0.27 ≈ attn_tau
+#   (3)  transform: { type: none } — drop acausal per-channel z-score
+#
+# SUCCESS CRITERIA (recorded against pre-registered hypotheses on exp23):
+#   A. val_loss < 0.30 by step ~500     (vs v1's 0.4425 floor)
+#   B. train_knot_spread_step > 1e-2 within 500 steps and STAYING there
+#   C. post-run deep_dive: every transformer layer's FFN fc1/fc2 weight
+#      RMS > 1e-3 (vs v2.1's ~1e-37 underflow).
+#
+# IF any of A/B/C fails, do NOT relaunch the long v3 — debug here first.
+#
+# Differences from `pretrain_eeg_from_scratch_v3.yaml`:
+#   - max_steps          90000 -> 2500
+#   - warmup_steps        2000 -> 200
+#   - stable_steps       80000 -> 2000
+#   - decay_steps         8000 -> 300
+#   - val_check_interval  1000 -> 200
+#   - every_n_train_steps 2000 -> 500
+#   - num_sanity_val_steps   2 -> 0  (skip Lightning's pre-train val to save time)
+#   - log_every_n_steps     50 -> 25 (denser progress for monitoring)
+#
+# Wall-clock estimate on 4xH100 SXM5 80GB at precision: 32-true:
+#   ~0.6-0.8 s/step (1.7x slower than bf16-mixed) → 25-35 minutes total.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v3_smoke
+
+# --------------------------------------------------------------------
+# Model — same as long v3 (fix #2)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+
+# --------------------------------------------------------------------
+# Data — fix #3 (no outer transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — fix #1 (precision in trainer block, weight_decay here)
+# --------------------------------------------------------------------
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 2000
+  decay_steps: 300
+  weight_decay: 1.0e-3
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+trainer:
+  max_steps: 2500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 200
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v3_smoke
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_v3_smoke_2500steps_fp32_balanced_residual
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - v3
+    - smoke
+    - fp32
+    - balanced_residual
+    - no_double_norm
+    - exp23
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v3_smoke
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 2
+  save_last: true
+  every_n_train_steps: 500

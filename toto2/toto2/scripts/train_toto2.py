@@ -5,31 +5,22 @@
 
 """Top-level training script for Toto 2.0.
 
-Supports two complementary modes selected via ``mode:`` in the YAML config:
-
-- ``from_scratch``: instantiate a fresh ``Toto2Model`` from the
-  ``model:`` block in the config and train end-to-end.
-- ``continue_pretrain``: load a published Toto 2.0 checkpoint
-  (e.g. ``Datadog/Toto-2.0-22m``) and continue pre-training on a
-  different distribution (e.g. EEG).
+Instantiates a fresh ``Toto2Model`` from the ``model:`` block in the YAML
+config and trains it end-to-end. Continue-pretraining from a published
+checkpoint is no longer supported (see lightning_module.py header); use
+``Toto2Model.from_pretrained`` for zero-shot inference / evaluation only.
 
 The script is intentionally minimal: dataset construction is delegated to a
 user-provided ``--dataset-builder`` callable so this file does not need to
-know about EEG-specific I/O. Two reference builders are shipped in
+know about EEG-specific I/O. A reference builder is shipped in
 ``examples/eeg_builder.py``.
 
 Usage
 -----
 
 ```bash
-# From-scratch pretraining
 python -m toto2.scripts.train_toto2 \
-    --config toto2/scripts/configs/pretrain_eeg_from_scratch.yaml \
-    --dataset-builder my_project.eeg:build_datasets
-
-# Continued pretraining
-python -m toto2.scripts.train_toto2 \
-    --config toto2/scripts/configs/continue_pretrain_eeg.yaml \
+    --config toto2/scripts/configs/pretrain_eeg_from_scratch_v3.yaml \
     --dataset-builder my_project.eeg:build_datasets
 ```
 
@@ -157,7 +148,6 @@ def _trainer_kwargs_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
-    mode = cfg.get("mode", "from_scratch")
     train_cfg = cfg.get("training", {})
     context_length = int(cfg.get("data", {}).get("context_length", 4096))
 
@@ -175,24 +165,10 @@ def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
         log_grad_norm=bool(train_cfg.get("log_grad_norm", True)),
     )
 
-    if mode == "from_scratch":
-        model_kwargs = _model_kwargs_from_config(cfg)
-        if not model_kwargs:
-            raise ValueError("`model:` block is required for mode=from_scratch.")
-        module = Toto2ForTraining(config=model_kwargs, **common_kwargs)
-    elif mode == "continue_pretrain":
-        model_id = cfg.get("pretrained_model_id")
-        if model_id is None:
-            raise ValueError("`pretrained_model_id` is required for mode=continue_pretrain.")
-        module = Toto2ForTraining.from_pretrained(
-            model_id=str(model_id),
-            map_location=str(cfg.get("map_location", "cpu")),
-            **common_kwargs,
-        )
-    else:
-        raise ValueError(f"Unknown mode: {mode!r}; expected 'from_scratch' or 'continue_pretrain'.")
-
-    return module
+    model_kwargs = _model_kwargs_from_config(cfg)
+    if not model_kwargs:
+        raise ValueError("`model:` block is required to instantiate Toto2ForTraining.")
+    return Toto2ForTraining(config=model_kwargs, **common_kwargs)
 
 
 # ----------------------------------------------------------------------
@@ -320,7 +296,7 @@ def configure_unit_scaling_for_world(cfg: Dict[str, Any], trainer: L.Trainer) ->
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Train or continue pre-training Toto 2.0.")
+    parser = argparse.ArgumentParser(description="Pre-train Toto 2.0 from scratch.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     parser.add_argument(
         "--dataset-builder",

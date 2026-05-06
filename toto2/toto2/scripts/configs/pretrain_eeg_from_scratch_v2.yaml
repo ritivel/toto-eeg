@@ -1,0 +1,162 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — pre-train from scratch on EEG, REVISED RECIPE (2026-W19).
+#
+# v1 (`pretrain_eeg_from_scratch.yaml`) stalled at val_loss ≈ 0.4425 across
+# 5,700 steps. Sanity-check on the resulting checkpoint
+# (toto2.scripts.examples.sanity_check) confirmed:
+#
+#   - The 9-quantile head had collapsed: knot spread = 1.1e-4
+#     (pinball loss above the 0.33 constant-median floor for asinh(N(0,1))
+#     because of slight target skew, but no actual quantile spread learned).
+#   - Trunk activations were dead: every layer's `attn.in_proj` output had
+#     RMS ≈ 8e-3 and every `ffn.fc1`/`fc2` output was identically 0.
+#   - 24/60 trainable parameters had grad RMS < 1e-8.
+#
+# Root cause: with `base_lr=5e-4`, u-µP's `1/√fan_in × 1/√depth` scaling
+# put the median weight LR at ≈ **7.4e-6** and the minimum (fc2 with
+# fan_in=1024) at **4.5e-6** — far below what AdamW needs to escape the
+# constant-median attractor on EEG. The lr_probe.py sweep on a fresh
+# init shows that `base_lr ∈ {5e-4, 2e-3, 5e-3, 1e-2}` are ALL stuck —
+# loss only moves from 0.4200 -> 0.4188 in 60 steps, and head knot
+# spread DECREASES (model is collapsing). At `base_lr=1e-1` the head
+# spread starts GROWING (3.97e-2 -> 4.14e-2 in 100 steps) and loss
+# drops 0.4200 -> 0.4132 — the first LR that actually escapes.
+#
+# Independent corroboration from the literature (priority sources):
+#   - MiniCPM 1.2B & 2.4B (Hu et al. 2024): `base_lr=0.01` muP-transferred AdamW
+#   - Granite 3.0 800M MoE: `peak 0.02` muP-transferred
+#   - u-µP paper (Blake et al. 2024 ICLR Spotlight) sweep range: η ∈ [2^-1, 2^3] = [0.5, 8]
+#     (their η is the unit-scaled internal LR; with dd_unit_scaling's
+#     1/sqrt(fan_in) external multiplier removed, our `base_lr` ≈ 1e-1
+#     corresponds to η ≈ 2^-3.3, just below their sweep floor — sensible
+#     for a smaller 22M model on a smoother quantile loss.)
+#
+# CHANGES vs. v1 (in priority order):
+#   1. base_lr  5e-4 -> 1e-1      (200x higher; lr_probe-validated)
+#   2. min_lr   1e-5 -> 5e-3      (proportional to base_lr ratio)
+#   3. compile  true -> false      (clean diagnostic surface)
+#   4. huber_kappa 0 -> 0.05      (gentle smoothing at the L_τ kink helps
+#                                  when targets have sharp asinh tails)
+#   5. warmup_steps 2000 -> 4000   (gentler ramp up to a much higher peak LR)
+#   6. logging.knot_spread is now logged automatically by the LightningModule
+#      so collapse is visible at every train step.
+#
+# Companion configs:
+#   - `pretrain_eeg_from_scratch_v3_normuon.yaml` — NorMuon variant
+#     (no 1/√fan_in penalty, base_lr=2e-2 per Karpathy nanochat default)
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_pretrained_v2
+
+# --------------------------------------------------------------------
+# Model architecture (unchanged — keep architecture comparable to v1)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 0.75
+  residual_attn_ratio: null
+
+# --------------------------------------------------------------------
+# Data (unchanged)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: standardize_per_channel
+
+# --------------------------------------------------------------------
+# Training — REVISED LR + smoother loss
+# --------------------------------------------------------------------
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3                      # was 5e-4. v2 first launch tried 1.0 (the
+                                    # LR-probe winner on a fixed batch + the
+                                    # multi-batch smoke trainer with single GPU),
+                                    # but in real DDP×4 training the loss
+                                    # bottomed at 0.218 around step 300 with
+                                    # effective trunk LR ≈ 4e-4 and then crept
+                                    # back up as warmup ramped LR through 0.4.
+                                    # 0.3 keeps peak below the empirical
+                                    # divergence onset and lets WSD park there.
+                                    # Still 600x higher than v1's broken 5e-4.
+  min_lr: 1.5e-2                    # 5% of base_lr (matches MiniCPM convention)
+  warmup_steps: 2000                # was 4000. Shorter ramp to a 3x lower peak.
+  stable_steps: 80000
+  decay_steps: 8000
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                 # was 0.0
+  log_grad_norm: true
+  compile: false                    # was true (disable while diagnosing)
+  matmul_precision: high
+  # world_size_override is left to the launcher; Lightning auto-detects.
+
+trainer:
+  max_steps: 90000
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 50
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 2
+  refresh_rate: 50
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_pretrain_v2
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_from_scratch_22m_v2.1_lr0.3
+  wandb_tags: [hbn, from_scratch, mumbai_h100, v2.1, lr0.3, no_compile, knot_spread, retuned]
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_pretrain_v2_1
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_knot_spread_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 2000

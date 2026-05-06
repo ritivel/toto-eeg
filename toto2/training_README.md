@@ -1,10 +1,16 @@
 # Toto 2.0 Training
 
-This directory adds **from-scratch pre-training** and **continued pre-training**
-support to Toto 2.0. The shipped Toto 2.0 package was designed for inference
-only; this submodule fills in the missing training loop, loss, optimizer, and
-data plumbing so you can pre-train (or continue pre-training) on a new
-domain such as EEG.
+This directory adds **from-scratch pre-training** support to Toto 2.0. The
+shipped Toto 2.0 package was designed for inference only; this submodule
+fills in the missing training loop, loss, optimizer, and data plumbing so
+you can pre-train on a new domain such as EEG.
+
+> Continue-pretraining from a published Datadog/Toto-2.0-* checkpoint is
+> **not supported**. The published checkpoints converged under a different
+> data distribution and recipe; in our HBN-EEG experiments we found that
+> resuming with a cold AdamW state on EEG reliably destroyed the
+> pretrained variance balance within a few hundred steps. Use
+> `Toto2Model.from_pretrained` for zero-shot inference / evaluation only.
 
 ## What's new
 
@@ -14,15 +20,14 @@ toto2/
 │   └── training/                 ← new
 │       ├── losses.py             # quantile/pinball loss
 │       ├── scheduler.py          # WSD LR schedule
-│       ├── lightning_module.py   # Toto2ForTraining (pretrain + continue-pretrain)
+│       ├── lightning_module.py   # Toto2ForTraining
 │       ├── datasets.py           # ArrayTimeSeriesDataset / HFTimeSeriesDataset
 │       ├── collate.py            # variate-padding collation
 │       └── datamodule.py         # TimeSeriesDataModule
 ├── scripts/                      ← new
 │   ├── train_toto2.py            # CLI entry point
 │   ├── configs/
-│   │   ├── pretrain_eeg_from_scratch.yaml
-│   │   └── continue_pretrain_eeg.yaml
+│   │   └── pretrain_eeg_from_scratch_v3.yaml
 │   └── examples/
 │       └── eeg_builder.py        # reference EEG dataset builder
 └── tests/
@@ -72,51 +77,20 @@ pip install git+https://github.com/microsoft/dion.git
 pip install "lightning>=2.2" pyyaml
 ```
 
-## Two training modes
-
-### 1. Continue pre-training (recommended start)
-
-This is the higher-leverage path: load a published Toto 2.0 checkpoint and
-adapt it to your domain. u-μP guarantees that the same recipe transfers
-across the published sizes (4M → 2.5B) so you can pick the largest model
-that fits on your GPU without re-tuning hyperparameters.
+## From-scratch pre-training
 
 ```bash
 python -m toto2.scripts.train_toto2 \
-    --config toto2/scripts/configs/continue_pretrain_eeg.yaml \
-    --dataset-builder toto2.scripts.examples.eeg_builder:build_datasets
-```
-
-Key knobs in `continue_pretrain_eeg.yaml`:
-
-```yaml
-mode: continue_pretrain
-pretrained_model_id: Datadog/Toto-2.0-22m   # or 313m / 1B / 2.5B
-
-training:
-  base_lr: 5.0e-5     # 10× smaller than from-scratch
-  warmup_steps: 500
-  stable_steps: 15000
-  decay_steps: 1500
-  huber_kappa: 0.05   # gentle smoothing for noisy EEG
-```
-
-### 2. From-scratch pre-training
-
-Use this when you want a model with a different architecture (e.g. smaller
-than 22M to iterate quickly, or with a different patch size suited to your
-sampling rate).
-
-```bash
-python -m toto2.scripts.train_toto2 \
-    --config toto2/scripts/configs/pretrain_eeg_from_scratch.yaml \
+    --config toto2/scripts/configs/pretrain_eeg_from_scratch_v3.yaml \
     --dataset-builder toto2.scripts.examples.eeg_builder:build_datasets
 ```
 
 The `model:` block of the YAML is forwarded to `Toto2ModelConfig`. Set
-`residual_attn_ratio: null` and the script computes
-`sqrt(S / log S)` automatically from `data.context_length / model.patch_size`,
-which is the value the dd-unit-scaling README documents for Toto 2.0.
+`residual_attn_ratio: null` and the script computes `sqrt(S / log S)`
+automatically from `data.context_length / model.patch_size` (Toto-2's
+default). Most EEG runs should override this explicitly to a u-µP-balanced
+value such as `1.0` — see the `pretrain_eeg_from_scratch_v3.yaml` header
+for the full v3 recipe rationale.
 
 ## Data format
 
@@ -257,7 +231,7 @@ Lightning checkpoints can be resumed transparently:
 
 ```bash
 python -m toto2.scripts.train_toto2 \
-    --config toto2/scripts/configs/continue_pretrain_eeg.yaml \
+    --config toto2/scripts/configs/pretrain_eeg_from_scratch_v3.yaml \
     --dataset-builder toto2.scripts.examples.eeg_builder:build_datasets \
     --resume-from checkpoints/.../last.ckpt
 ```

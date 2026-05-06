@@ -21,13 +21,10 @@ construction (and before any FSDP wrapping or ``torch.compile`` in the
 training script) so that the ``dd_unit_scaling.AdamW`` / ``Dion2`` /
 ``NorMuon`` optimizers can apply the correct per-parameter LR scaling.
 
-Both *from-scratch pre-training* and *continued pre-training* are supported
-via two construction paths:
-
-- ``Toto2ForTraining(config=...)`` — builds a fresh ``Toto2Model`` (random
-  init).
-- ``Toto2ForTraining.from_pretrained(model_id=...)`` — loads a published
-  Toto 2.0 checkpoint and resumes training.
+Constructed via ``Toto2ForTraining(config=...)`` which builds a fresh
+``Toto2Model`` (random init). Continue-pretraining from a published
+checkpoint is no longer supported — use the HF inference loader
+(``Toto2Model.from_pretrained``) for zero-shot evaluation only.
 """
 
 from __future__ import annotations
@@ -79,10 +76,6 @@ class Toto2ForTraining(L.LightningModule):
         hyperparameters. If a dict is passed and ``residual_attn_ratio`` is
         ``None``, it is computed automatically from ``context_length`` and
         ``patch_size``.
-    pretrained_model
-        Optional Toto 2.0 ``Toto2Model`` instance to start training from
-        (used for continued pre-training). When provided, ``config`` is
-        ignored and the model's own config is used.
     context_length
         Number of input timesteps fed to the model. Must be a multiple of
         ``patch_size``. Used both for ``residual_attn_ratio`` derivation
@@ -115,9 +108,8 @@ class Toto2ForTraining(L.LightningModule):
 
     def __init__(
         self,
-        config: Optional[Toto2ModelConfig | Dict[str, Any]] = None,
+        config: Toto2ModelConfig | Dict[str, Any],
         *,
-        pretrained_model: Optional[Toto2Model] = None,
         context_length: int = 4096,
         base_lr: float = 5e-4,
         min_lr: float = 1e-5,
@@ -133,20 +125,14 @@ class Toto2ForTraining(L.LightningModule):
     ) -> None:
         super().__init__()
 
-        # Resolve / build the underlying Toto 2.0 model
-        if pretrained_model is not None:
-            self.model = pretrained_model
-        elif config is not None:
-            if isinstance(config, dict):
-                cfg = _build_residual_attn_ratio(config, context_length)
-                model_config = Toto2ModelConfig(**cfg)
-            elif isinstance(config, Toto2ModelConfig):
-                model_config = config
-            else:
-                raise TypeError(f"Unsupported config type: {type(config)!r}")
-            self.model = Toto2Model(model_config)
+        if isinstance(config, dict):
+            cfg = _build_residual_attn_ratio(config, context_length)
+            model_config = Toto2ModelConfig(**cfg)
+        elif isinstance(config, Toto2ModelConfig):
+            model_config = config
         else:
-            raise ValueError("Pass either `config=...` or `pretrained_model=...`.")
+            raise TypeError(f"Unsupported config type: {type(config)!r}")
+        self.model = Toto2Model(model_config)
 
         self.context_length = int(context_length)
         if self.context_length % self.model.config.patch_size != 0:
@@ -333,6 +319,23 @@ class Toto2ForTraining(L.LightningModule):
             sync_dist=True,
             batch_size=target.shape[0],
         )
+
+        # Quantile-head health: spread across the 9 knots. If this collapses to ~0
+        # the head has degenerated to a constant predictor and pinball loss
+        # plateaus near 0.33–0.40 even though the trunk could carry more signal.
+        # Cheap to compute (one std over the 9-knot axis), surfaces collapse
+        # before a full epoch elapses.
+        with torch.no_grad():
+            knot_spread = quantiles.std(dim=0).mean()
+            self.log(
+                f"{stage}_knot_spread",
+                knot_spread,
+                prog_bar=False,
+                on_step=stage == "train",
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=target.shape[0],
+            )
         return loss
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -430,44 +433,6 @@ class Toto2ForTraining(L.LightningModule):
                     )
             except Exception:
                 pass
-
-    # ------------------------------------------------------------------
-    # Convenience constructors
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_id: str,
-        *,
-        context_length: int = 4096,
-        map_location: str = "cpu",
-        **trainer_kwargs: Any,
-    ) -> "Toto2ForTraining":
-        """Load a Toto 2.0 checkpoint and wrap it for continued pre-training.
-
-        Parameters
-        ----------
-        model_id
-            Either a HuggingFace repo id (e.g. ``"Datadog/Toto-2.0-22m"``) or
-            a local path containing ``config.json`` plus a ``safetensors``
-            checkpoint.
-        context_length
-            Context length to use for training (must be compatible with the
-            checkpoint's RoPE max length, which is 8192 for the public
-            Toto 2.0 family).
-        map_location
-            Device to load weights onto initially.
-        trainer_kwargs
-            Forwarded to :meth:`__init__` (LR, schedule, optimizer, …).
-        """
-        model = Toto2Model.from_pretrained(model_id, map_location=map_location)
-        # Continue training requires gradients enabled (HF ``from_pretrained``
-        # leaves ``requires_grad=True`` by default but we restore train mode).
-        model.train()
-        for p in model.parameters():
-            p.requires_grad_(True)
-        return cls(pretrained_model=model, context_length=context_length, **trainer_kwargs)
 
     # ------------------------------------------------------------------
     # Utilities

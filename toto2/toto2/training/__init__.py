@@ -6,8 +6,8 @@
 """Toto 2.0 training pipeline.
 
 Provides PyTorch Lightning modules, loss functions, schedulers, and data
-modules required to pre-train Toto 2.0 from scratch or continue pre-training
-on new domains (e.g., EEG signals).
+modules required to pre-train Toto 2.0 from scratch on new domains
+(e.g., EEG signals).
 """
 
 from .collate import collate_timeseries
