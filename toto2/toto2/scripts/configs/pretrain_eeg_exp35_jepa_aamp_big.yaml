@@ -1,0 +1,139 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp35 BIG: JEPA + AAMP at 2.8x model scale.
+#
+# exp34 finished with val_loss=0.1675 (best step-30000 ckpt) using
+# d_model=384, num_layers=12 (23.8M params). The combination JEPA +
+# AAMP + mp_residual at 30000 steps decisively beat the previous
+# best (exp27 JEPA-only at 0.182, exp26 Probe F at 0.1838).
+#
+# This experiment scales the trunk to d_model=512, num_layers=18 (~67M
+# params, 2.8x larger) with the same proven recipe and ~20000 steps
+# in a 3-4 hour wall-clock budget on 4×H100. The hypothesis is that
+# the auxiliary supervision now has a bigger model to inhabit, so
+# val_loss should drop further (target ≤ 0.16).
+#
+# Memory budget: at d_model=384 / bs=12 / JEPA on, exp34 used 56 GB /
+# 80 GB. Scaling to d_model=512 / num_layers=18 increases params by
+# 2.8x but activations only ~1.8x because seq is unchanged.  Drop bs
+# from 12 to 8 to stay under 70 GB.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp35_jepa_aamp_big
+
+model:
+  patch_size: 64
+  d_model: 512                 # was 384 in exp34 (1.33x)
+  num_heads: 8                 # head_dim stays 64
+  num_layers: 18               # was 12 in exp34 (1.5x)
+  layer_group_size: 18
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 8          # down from exp34's 12 to fit bigger model
+  val_batch_size: 12
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 44                     # different seed from exp33 (42), exp34 (43)
+  optimizer: adamw
+  base_lr: 0.3                 # u-μP base_lr is width-invariant by design
+  min_lr: 1.5e-2
+  warmup_steps: 600
+  stable_steps: 18400
+  decay_steps: 1000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+
+trainer:
+  max_steps: 20000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp35_jepa_aamp_big
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp35_jepa_aamp_big_67m_20k
+  wandb_tags:
+    - hbn
+    - mumbai_h100
+    - exp35
+    - long_run
+    - bigger_model
+    - jepa
+    - aamp
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp35_jepa_aamp_big
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_jepa_loss_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500
