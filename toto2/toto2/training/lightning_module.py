@@ -41,11 +41,86 @@ import dd_unit_scaling as uu
 
 from ..configuration import Toto2ModelConfig
 from ..model import Toto2Model
+from .auxiliary_losses import (
+    JEPAHead,
+    MultiResolutionSTFTAuxLoss,
+    PARSHead,
+    amplitude_aware_cpm_mask,
+    online_denoise_target,
+    phase_aware_fourier_loss,
+)
 from .losses import QuantileLoss
 from .scheduler import WarmupStableDecayLR
 
 
 OptimizerName = Literal["adamw", "normuon", "dion2"]
+
+
+# =====================================================================
+# exp27 auxiliary supervision configuration helpers
+# =====================================================================
+#
+# The lightning module accepts a single ``auxiliary`` dict that
+# enumerates which probes are active and the per-probe hyperparameters.
+# This lets a single yaml config switch any combination on/off without
+# touching the python — exactly the pattern exp24/25/26 used for the
+# trunk fixes.  Defaults are conservative (probe disabled).
+
+
+_DEFAULT_AUX = {
+    "jepa": {
+        "enabled": False,
+        "weight": 0.5,
+        "sigreg_weight": 0.02,
+        "proj_dim": 256,
+        "ema_tau": 0.999,
+        "sigreg_num_slices": 1024,
+        "sigreg_n_quad_points": 17,
+    },
+    "aamp": {
+        "enabled": False,
+        "mask_ratio_range": (0.20, 0.40),
+    },
+    "pars": {
+        "enabled": False,
+        "weight": 0.1,
+        "num_pairs": 12,
+        "head_dim": 64,
+        "mlp_hidden": 512,
+    },
+    "phase": {
+        "enabled": False,
+        "weight": 0.1,
+    },
+    "mrstft": {
+        "enabled": False,
+        "weight": 0.1,
+        "fft_sizes": (32, 128, 512),
+        "hop_sizes": (8, 32, 128),
+        "win_sizes": None,  # defaults to fft_sizes
+    },
+    "denoise": {
+        "enabled": False,
+        "low_hz": 1.0,
+        "high_hz": 50.0,
+        "sfreq": 500.0,
+        "clip_sigma": 6.0,
+        "detrend": True,
+    },
+}
+
+
+def _merge_aux_config(user: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out = {k: dict(v) for k, v in _DEFAULT_AUX.items()}
+    if not user:
+        return out
+    for k, v in user.items():
+        if k not in out:
+            raise ValueError(
+                f"Unknown auxiliary key {k!r}; expected one of {list(out)}."
+            )
+        out[k].update(v)
+    return out
 
 
 def _build_residual_attn_ratio(
@@ -122,6 +197,7 @@ class Toto2ForTraining(L.LightningModule):
         quantile_levels: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
         huber_kappa: float = 0.0,
         log_grad_norm: bool = True,
+        auxiliary: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -160,6 +236,41 @@ class Toto2ForTraining(L.LightningModule):
         self.optimizer_name = optimizer_name
         self.log_grad_norm = bool(log_grad_norm)
 
+        # ----- exp27 auxiliary heads / config -----
+        self.aux_cfg = _merge_aux_config(auxiliary)
+
+        d_model = self.model.config.d_model
+        if self.aux_cfg["jepa"]["enabled"]:
+            self.jepa_head = JEPAHead(
+                d_model=d_model,
+                proj_dim=int(self.aux_cfg["jepa"]["proj_dim"]),
+                ema_tau=float(self.aux_cfg["jepa"]["ema_tau"]),
+                sigreg_num_slices=int(self.aux_cfg["jepa"]["sigreg_num_slices"]),
+                sigreg_n_quad_points=int(self.aux_cfg["jepa"]["sigreg_n_quad_points"]),
+            )
+        else:
+            self.jepa_head = None
+
+        if self.aux_cfg["pars"]["enabled"]:
+            self.pars_head = PARSHead(
+                d_model=d_model,
+                num_pairs=int(self.aux_cfg["pars"]["num_pairs"]),
+                head_dim=int(self.aux_cfg["pars"]["head_dim"]),
+                mlp_hidden=int(self.aux_cfg["pars"]["mlp_hidden"]),
+            )
+        else:
+            self.pars_head = None
+
+        if self.aux_cfg["mrstft"]["enabled"]:
+            mrcfg = self.aux_cfg["mrstft"]
+            self.mrstft_loss = MultiResolutionSTFTAuxLoss(
+                fft_sizes=tuple(mrcfg["fft_sizes"]),
+                hop_sizes=tuple(mrcfg["hop_sizes"]),
+                win_sizes=tuple(mrcfg["win_sizes"]) if mrcfg.get("win_sizes") is not None else None,
+            )
+        else:
+            self.mrstft_loss = None
+
         # Save hyperparameters (Lightning checkpoint metadata). We deliberately
         # avoid serializing the pre-built model object.
         hparams = {
@@ -175,6 +286,7 @@ class Toto2ForTraining(L.LightningModule):
             "huber_kappa": float(huber_kappa),
             "quantile_levels": list(quantile_levels),
             "model_config": asdict(self.model.config),
+            "auxiliary": self.aux_cfg,
         }
         self.save_hyperparameters(hparams)
 
@@ -357,7 +469,7 @@ class Toto2ForTraining(L.LightningModule):
             )
 
     def _step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
-        """Compute next-patch quantile loss on a collated batch.
+        """Compute next-patch quantile loss + auxiliary supervision (exp27 suite).
 
         The recipe mirrors LLM-style next-token training, lifted to patches:
         the input is ``series[0 : context_length]`` and the target at patch
@@ -368,6 +480,23 @@ class Toto2ForTraining(L.LightningModule):
         output head predicts in — so we reproduce the inference-time
         un-asinh / un-scale operations only at evaluation, never during
         training (matching ``forecast()``'s ``block_q.sinh() * scale + loc``).
+
+        On top of pinball, exp27 layers in optional auxiliary supervision
+        controlled by ``self.aux_cfg`` (see :data:`_DEFAULT_AUX`):
+
+        * **B-AAMP** (``aamp``) — modify ``cpm_mask`` to drop top-K%
+          amplitude patches before the scaler / patch_proj see them.
+        * **F-Denoise** (``denoise``) — replace the pinball *target*
+          (not the input) with a band-passed, sigma-clipped, detrended
+          version so the model has to denoise as it predicts.
+        * **A-JEPA** (``jepa``) — predict next-patch latents of an EMA
+          target encoder; SIGReg the projected context.
+        * **C-PARS** (``pars``) — predict the antisymmetric NxN matrix
+          of pairwise relative shifts on a random subset of patches.
+        * **D-Phase** (``phase``) — Fourier-domain log-amp + sin/cos-φ
+          MSE on the median-knot prediction.
+        * **E-MRSTFT** (``mrstft``) — multi-resolution STFT loss on the
+          median-knot prediction.
         """
         target = batch["target"]              # (B, V, context_length + patch_size)
         target_mask = batch["target_mask"]    # (B, V, context_length + patch_size)
@@ -386,21 +515,44 @@ class Toto2ForTraining(L.LightningModule):
         gt_next = target[..., P : self.context_length + P]
         gt_mask = target_mask[..., P : self.context_length + P]
 
+        # ----- B-AAMP: modify the causal-patch mask to drop high-amplitude patches -----
+        # The base ``input_mask`` still defines what counts as observed;
+        # AAMP only changes what the **scaler / patch_proj** see, by
+        # dropping a randomly-sized fraction of the highest-amplitude
+        # patches.  Pinball is still computed on every observed gt
+        # position.  The ``no_grad`` decorator on ``amplitude_aware_cpm_mask``
+        # ensures gradients don't flow through the percentile thresholding.
+        if stage == "train" and self.aux_cfg["aamp"]["enabled"]:
+            cpm_mask = amplitude_aware_cpm_mask(
+                input_target,
+                input_mask,
+                patch_size=P,
+                mask_ratio_range=tuple(self.aux_cfg["aamp"]["mask_ratio_range"]),
+            )
+        else:
+            cpm_mask = input_mask
+
         # Re-key padding variates (series_id == -1) so loss isn't computed on them.
         valid_variate = (series_ids != -1).unsqueeze(-1)  # (B, V, 1)
         loss_mask = gt_mask & valid_variate
 
         # Run the model on the *input* portion only — this is the same
         # forward pass that produces quantile predictions during inference.
-        # At validation we also capture the post-trunk activation so we can
-        # compute effective-rank / anisotropy diagnostics; the hook is
-        # zero-cost during training (we don't enter the context manager).
-        if stage == "val":
+        # We always capture the post-trunk activation when JEPA or PARS
+        # is active (their auxiliary losses operate on the trunk
+        # output).  At validation we capture for the trunk-health
+        # diagnostics regardless.
+        capture_trunk = (
+            stage == "val"
+            or (stage == "train" and (self.aux_cfg["jepa"]["enabled"] or self.aux_cfg["pars"]["enabled"]))
+        )
+        if capture_trunk:
             with self._capture_trunk() as cap:
                 outputs = self.forward(
                     target=input_target,
                     target_mask=input_mask,
                     series_ids=series_ids,
+                    cpm_mask=cpm_mask,
                 )
             trunk_act = cap.trunk_act
         else:
@@ -408,6 +560,7 @@ class Toto2ForTraining(L.LightningModule):
                 target=input_target,
                 target_mask=input_mask,
                 series_ids=series_ids,
+                cpm_mask=cpm_mask,
             )
             trunk_act = None
         quantiles = outputs.quantiles  # (Q, B, V, n_patches, P)
@@ -420,7 +573,32 @@ class Toto2ForTraining(L.LightningModule):
         # position within a patch — we choose the first.
         loc_per_patch = rearrange(loc, "b v (s p) -> b v s p", p=P)[..., 0]
         scale_per_patch = rearrange(scale, "b v (s p) -> b v s p", p=P)[..., 0]
-        gt_per_patch = rearrange(gt_next, "b v (s p) -> b v s p", p=P)
+
+        # ----- F-Denoise: replace the pinball target with a denoised version -----
+        # (input is unchanged; only the target the loss compares against
+        # is run through the simple online filter chain in
+        # online_denoise_target.)
+        if stage == "train" and self.aux_cfg["denoise"]["enabled"]:
+            dcfg = self.aux_cfg["denoise"]
+            # Concat input + gt_next so the IIR sees a continuous signal,
+            # then slice off the gt portion afterwards.  This avoids a
+            # transient at the seam.
+            concat = torch.cat([input_target, gt_next], dim=-1)
+            concat_mask = torch.cat([input_mask, gt_mask], dim=-1)
+            denoised = online_denoise_target(
+                concat,
+                concat_mask,
+                sfreq=float(dcfg["sfreq"]),
+                low_hz=float(dcfg["low_hz"]),
+                high_hz=float(dcfg["high_hz"]),
+                clip_sigma=float(dcfg["clip_sigma"]),
+                detrend=bool(dcfg["detrend"]),
+            )
+            denoise_gt_next = denoised[..., self.context_length :]
+        else:
+            denoise_gt_next = gt_next
+
+        gt_per_patch = rearrange(denoise_gt_next, "b v (s p) -> b v s p", p=P)
         gt_mask_per_patch = rearrange(loss_mask, "b v (s p) -> b v s p", p=P)
 
         eps = torch.finfo(gt_per_patch.dtype).eps
@@ -440,14 +618,92 @@ class Toto2ForTraining(L.LightningModule):
         # Compute pinball loss only over patches that have any observed
         # target steps; further weight by per-step observation mask.
         # quantiles[..., n_patches, P] aligns 1:1 with asinh_gt[..., n_patches, P].
-        loss = self.loss_fn(quantiles, asinh_gt, weights=gt_mask_per_patch.to(quantiles.dtype))
+        pinball_loss = self.loss_fn(quantiles, asinh_gt, weights=gt_mask_per_patch.to(quantiles.dtype))
+        total_loss = pinball_loss
+
+        # ---- exp27 auxiliary losses ----
+        # Each is conditionally applied if its config flag is enabled.
+        # Their per-loss values + diagnostics are logged with `stage` prefix
+        # for direct comparison to pinball.
+        aux_log: Dict[str, torch.Tensor] = {}
+        if stage == "train":
+            if self.jepa_head is not None:
+                # ``trunk_act`` is captured above; pass through JEPA head.
+                # The JEPA target tower runs internally inside JEPAHead.
+                # ``valid_seq_mask`` is True at positions where the gt patch
+                # is observed AND the variate is real.
+                valid_seq = (gt_mask_per_patch.float().mean(dim=-1) > 0) & valid_variate
+                jepa_l, sigreg_l, jepa_metrics = self.jepa_head(
+                    context_trunk_act=trunk_act,
+                    target_input=input_target,
+                    target_input_mask=input_mask,
+                    target_input_cpm_mask=cpm_mask,
+                    series_ids=series_ids,
+                    patch_size=P,
+                    global_step=int(self.global_step),
+                    valid_loss_mask=valid_seq,
+                )
+                jepa_w = float(self.aux_cfg["jepa"]["weight"])
+                sigreg_w = float(self.aux_cfg["jepa"]["sigreg_weight"])
+                total_loss = total_loss + jepa_w * jepa_l + sigreg_w * sigreg_l
+                aux_log["jepa_loss"] = jepa_l.detach()
+                aux_log["sigreg_loss"] = sigreg_l.detach()
+                for k, v in jepa_metrics.items():
+                    aux_log[k] = v
+
+            if self.pars_head is not None:
+                valid_seq = (gt_mask_per_patch.float().mean(dim=-1) > 0) & valid_variate
+                pars_l, pars_metrics = self.pars_head(
+                    trunk_act,
+                    valid_seq_mask=valid_seq,
+                )
+                pars_w = float(self.aux_cfg["pars"]["weight"])
+                total_loss = total_loss + pars_w * pars_l
+                aux_log["pars_loss"] = pars_l.detach()
+                for k, v in pars_metrics.items():
+                    aux_log[k] = v
+
+            if self.aux_cfg["phase"]["enabled"]:
+                phase_l, phase_metrics = phase_aware_fourier_loss(
+                    quantiles=quantiles,
+                    asinh_gt=asinh_gt,
+                    weights=gt_mask_per_patch,
+                    median_idx=self._knot_indices_for(0.5)[0],
+                )
+                phase_w = float(self.aux_cfg["phase"]["weight"])
+                total_loss = total_loss + phase_w * phase_l
+                aux_log["phase_loss"] = phase_l.detach()
+                for k, v in phase_metrics.items():
+                    aux_log[k] = v
+
+            if self.mrstft_loss is not None:
+                stft_l, stft_metrics = self.mrstft_loss(
+                    quantiles=quantiles,
+                    asinh_gt=asinh_gt,
+                    weights=gt_mask_per_patch,
+                    median_idx=self._knot_indices_for(0.5)[0],
+                )
+                stft_w = float(self.aux_cfg["mrstft"]["weight"])
+                total_loss = total_loss + stft_w * stft_l
+                aux_log["mrstft_loss"] = stft_l.detach()
+                for k, v in stft_metrics.items():
+                    aux_log[k] = v
 
         # ---- diagnostics ----
         observed_frac = gt_mask_per_patch.float().mean()
         self.log(
             f"{stage}_loss",
-            loss,
+            total_loss,
             prog_bar=True,
+            on_step=stage == "train",
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=target.shape[0],
+        )
+        self.log(
+            f"{stage}_pinball",
+            pinball_loss,
+            prog_bar=False,
             on_step=stage == "train",
             on_epoch=True,
             sync_dist=True,
@@ -461,6 +717,18 @@ class Toto2ForTraining(L.LightningModule):
             sync_dist=True,
             batch_size=target.shape[0],
         )
+
+        # Auxiliary diagnostics (train only — they all condition on `stage == 'train'`).
+        for k, v in aux_log.items():
+            self.log(
+                f"{stage}_{k}",
+                v,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=target.shape[0],
+            )
 
         # Quantile-head health: spread across the 9 knots. If this collapses to ~0
         # the head has degenerated to a constant predictor and pinball loss
@@ -498,7 +766,7 @@ class Toto2ForTraining(L.LightningModule):
                         trunk_act=trunk_act,
                         batch_size=target.shape[0],
                     )
-        return loss
+        return total_loss
 
     # ------------------------------------------------------------------
     # Probabilistic-forecast diagnostics (val-only)
@@ -638,13 +906,20 @@ class Toto2ForTraining(L.LightningModule):
     # ------------------------------------------------------------------
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Cache u-μP fan values before optimizer construction.
+        """Cache u-μP fan values before optimizer construction; build JEPA target.
 
         ``dd_unit_scaling`` requires ``cache_fan_values`` to be called *before*
         FSDP wrapping (which replaces parameter tensors with DTensors and
         loses the original fan-in). Calling it here in ``setup`` runs after
         DDP/FSDP rank initialisation but before
         :meth:`configure_optimizers`.
+
+        We also instantiate the JEPA target tower here — :class:`JEPAHead`
+        deep-copies the online scaler / patch_proj / trunk so the target's
+        weights are independent and only updated via :meth:`on_train_batch_end`'s
+        EMA.  Doing this in ``setup`` (rather than ``__init__``) ensures the
+        copy sees any post-init mutations (e.g., :class:`SigmaReparamLinear`
+        γ buffers).
         """
         super().setup(stage)
         try:
@@ -653,6 +928,28 @@ class Toto2ForTraining(L.LightningModule):
             # If running without unit-scaling-tagged params, optimizer falls
             # back to standard scaling. We tolerate this for compatibility.
             pass
+
+        if self.jepa_head is not None and getattr(self.jepa_head, "_target_trunk", None) is None:
+            self.jepa_head.setup_target(
+                scaler=self.model.scaler,
+                patch_proj=self.model.patch_proj,
+                trunk=self.model.transformer,
+            )
+
+    def on_train_batch_end(
+        self,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Update the JEPA target tower's EMA weights after each training step."""
+        super().on_train_batch_end(outputs, batch, batch_idx)
+        if self.jepa_head is not None:
+            self.jepa_head.update_ema(
+                scaler=self.model.scaler,
+                patch_proj=self.model.patch_proj,
+                trunk=self.model.transformer,
+            )
 
     def configure_optimizers(self):
         params = [p for p in self.model.parameters() if p.requires_grad]

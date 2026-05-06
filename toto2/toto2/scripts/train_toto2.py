@@ -151,6 +151,12 @@ def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
     train_cfg = cfg.get("training", {})
     context_length = int(cfg.get("data", {}).get("context_length", 4096))
 
+    # exp27 supervision-augmentation suite: optional ``training.auxiliary``
+    # block selecting which probes (jepa / aamp / pars / phase / mrstft /
+    # denoise) are active and their hyperparameters.  See
+    # ``toto2.training.lightning_module._DEFAULT_AUX`` for shape.
+    auxiliary = train_cfg.get("auxiliary")
+
     common_kwargs = dict(
         context_length=context_length,
         base_lr=float(train_cfg.get("base_lr", 5e-4)),
@@ -163,6 +169,7 @@ def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
         optimizer_name=train_cfg.get("optimizer", "adamw"),
         huber_kappa=float(train_cfg.get("huber_kappa", 0.0)),
         log_grad_norm=bool(train_cfg.get("log_grad_norm", True)),
+        auxiliary=auxiliary,
     )
 
     model_kwargs = _model_kwargs_from_config(cfg)

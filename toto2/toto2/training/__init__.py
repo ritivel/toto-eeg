@@ -10,6 +10,15 @@ modules required to pre-train Toto 2.0 from scratch on new domains
 (e.g., EEG signals).
 """
 
+from .auxiliary_losses import (
+    JEPAHead,
+    MultiResolutionSTFTAuxLoss,
+    PARSHead,
+    amplitude_aware_cpm_mask,
+    online_denoise_target,
+    phase_aware_fourier_loss,
+    sigreg_loss,
+)
 from .collate import collate_timeseries
 from .datamodule import TimeSeriesDataModule
 from .datasets import (
@@ -33,4 +42,12 @@ __all__ = [
     "LazyNpzTimeSeriesDataset",
     "SlidingWindowConfig",
     "collate_timeseries",
+    # exp27 auxiliary supervision suite
+    "JEPAHead",
+    "MultiResolutionSTFTAuxLoss",
+    "PARSHead",
+    "amplitude_aware_cpm_mask",
+    "online_denoise_target",
+    "phase_aware_fourier_loss",
+    "sigreg_loss",
 ]
