@@ -1,0 +1,136 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp33 JEPA-LONG: long-horizon LeJEPA pretraining.
+#
+# Built on top of the exp27 winning recipe (val_loss=0.182 at step
+# 5500, beating exp26 Probe F baseline 0.1838).  We extend the same
+# JEPA + SIGReg auxiliary at λ_jepa=0.1 / λ_sigreg=0.01 from a 5500-
+# step smoke to a 35000-step long run on GPUs 0-3, ~6 hour budget on
+# 4× H100 at ~1.95 it/s.
+#
+# Hypothesis: exp27's monotonic val_loss decrease (0.200 → 0.196 →
+# 0.192 → 0.190 → 0.189 → 0.187 → 0.182) shows the auxiliary keeps
+# learning past the smoke horizon.  At 35k steps the v2.1 90k-step
+# baseline reached 0.219; at 35k *with* JEPA on top of mp_residual we
+# expect ≤ 0.17 if exp27's slope continues.
+#
+# Decision rule: success = val_loss ≤ 0.17 by step 35000 AND
+# val_trunk_eff_rank_ratio ≥ 0.30 throughout.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp33_jepa_long
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12         # JEPA target tower memory; matches exp27
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 42
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000           # scale-up from 200 to match longer horizon
+  stable_steps: 32000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999          # tighter EMA for longer horizon (5500-step
+                              # smoke used 0.99; at 35k 0.999 is the
+                              # I-JEPA / LeJEPA paper default)
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+
+trainer:
+  max_steps: 35000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp33_jepa_long
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp33_jepa_long_35k
+  wandb_tags:
+    - hbn
+    - mumbai_h100
+    - exp33
+    - long_run
+    - jepa
+    - sigreg
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp33_jepa_long
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_jepa_loss_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500
