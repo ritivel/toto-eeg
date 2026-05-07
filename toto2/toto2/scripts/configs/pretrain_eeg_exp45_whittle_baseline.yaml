@@ -1,0 +1,208 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp45 Univariate Whittle on the NORMAL baseline.
+#
+# Tests the hypothesis:
+#
+#   "Is the frequency-domain Gaussian likelihood (Whittle 1953) a
+#    better primary loss for EEG SSL than pinball / AMSE?"
+#
+# This is exp45 in the experiments table — the *baseline* arm (no
+# auxiliary supervision), using the univariate Whittle pseudo-likelihood
+# as the primary loss on the median quantile prediction.
+#
+# WHAT CHANGES vs. exp43 (AMSE baseline)
+# ---------------------------------------------------------
+# Only the supervision objective: AMSE -> Whittle NLL on the median knot.
+# Everything else — trunk architecture (mp_residual, qk_norm, 24M
+# d_model=384x12), data pipeline, optimizer (AdamW, base_lr=0.3, wd=0),
+# precision (32-true), schedule (WSD), seed conventions — matches the
+# exp43 / Probe F recipe so the comparison is unambiguous.
+#
+# WHITTLE PSEUDO-LIKELIHOOD (Whittle 1953, Hannan 1973)
+# ---------------------------------------------------
+# The model's median prediction implies a PSD S(ω_k) = |FFT(pred)|².
+# The target's periodogram is I(ω_k) = |FFT(target)|². The loss:
+#
+#     L_Whittle = mean_k [log S(ω_k) + I(ω_k) / S(ω_k)]
+#
+# Key properties for EEG:
+#
+# 1. Spectrally weighted by 1/S(ω): high-power frequencies (alpha/beta)
+#    and low-power frequencies (gamma/drift) are normalised by their own
+#    variance. No more "first 3 patches dominate the loss".
+#
+# 2. The trunk MUST learn the spectrum to win. No degenerate "smart
+#    causal scaler + identity residual" path — the FFN has to encode
+#    actual frequency-domain structure to minimize log S + I/S.
+#
+# 3. Phase-agnostic on autospectra (ok for univariate EEG — within a
+#    single channel, phase is reference-dependent and arbitrary).
+#
+# 4. KL divergence interpretation: Whittle NLL = D_KL(I || S_θ) + const.
+#    Compression objective by construction.
+#
+# 5. Operationally validated: Yu et al. ICML 2021 "Whittle Networks",
+#    UAI 2022 "Predictive Whittle Networks", Liu et al. 2025 on
+#    gravitational-wave data.
+#
+# DIAGNOSTICS (read in WandB / TB during training)
+# ------------------------------------------------
+# - train_whittle / val_whittle:    the new primary loss (Whittle NLL)
+# - train_whittle_psd_ratio:        S_pred / I_target averaged (~1 = healthy)
+# - train_whittle_log_ratio:        log(S_pred / I_target) averaged (~0)
+# - train_whittle_low_freq_ratio:   PSD ratio for low-frequency half
+# - train_whittle_high_freq_ratio:  PSD ratio for high-frequency half
+# - train_whittle_log_term_mean:    mean of log S(ω) component
+# - train_whittle_ratio_term_mean:  mean of I(ω)/S(ω) component
+# - train_pinball / val_pinball:    always computed for cross-comparison
+# - val_trunk_rms / val_trunk_eff_rank_ratio / val_trunk_anisotropy:
+#                                   canonical trunk-health probes
+# - train_knot_spread:              quantile knots' spread
+#
+# DECISION RULE (after 5500 steps + ridge probe on TUAB)
+# ------------------------------------------------------
+# Decision A: val_whittle decreases monotonically AND FFN weight RMS >=
+#             1e-3 AND TUAB AUROC >= Probe F + 0.01
+#             -> Whittle IS a viable primary loss for EEG SSL.
+#                Compare with exp43 (AMSE) for the better spectral loss.
+# Decision B: val_whittle stalls OR FFN collapses OR TUAB drops
+#             -> Whittle's phase-agnosticism is too lossy for EEG at
+#                this scale; the multivariate extension is needed.
+#
+# WALL-CLOCK on 4xH100 SXM5 80GB at precision: 32-true
+# ----------------------------------------------------
+# Same as exp43: ~0.6-0.8 s/step.  Whittle adds one rfft + log/div
+# per step — negligible cost.  5500 steps -> ~75 minutes wall-clock.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp45_whittle_baseline
+
+# --------------------------------------------------------------------
+# Model — same as exp43 / exp26 Probe F (mp_residual baseline)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+# --------------------------------------------------------------------
+# Data — same as exp43 (HBN-EEG, no outer transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp43 recipe + exp45 Whittle primary loss
+# --------------------------------------------------------------------
+training:
+  seed: 47                              # unique to exp45
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  # ---------- exp45 Whittle supervision ----------
+  loss_type: whittle
+  whittle:
+    concat_patches: true                # FFT over the full 4096-sample
+                                        # sequence (covers delta/theta/alpha/
+                                        # beta/gamma).
+    spectral_weight_exponent: 0.0       # 0 = uniform (vanilla Whittle).
+    normalize_by_freq: true             # MEAN over freq bins so Whittle has
+                                        # per-element scale comparable to
+                                        # pinball/AMSE.  Required for base_lr
+                                        # transfer.
+    psd_floor: 1.0e-8                   # min PSD for log/div stability
+    pinball_calibration_weight: 0.0     # pure Whittle; no pinball term
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp45_whittle_baseline
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp45_whittle_baseline_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - exp45
+    - whittle
+    - whittle_1953
+    - probe_f_baseline
+    - mp_residual
+    - no_aux
+    - psd_prediction
+    - frequency_domain
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp45_whittle_baseline
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_whittle_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 500

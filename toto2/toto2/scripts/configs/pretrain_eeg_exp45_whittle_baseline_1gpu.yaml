@@ -1,0 +1,131 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp45 Univariate Whittle on the NORMAL baseline (1×A100).
+#
+# Single-GPU variant for GCP a2-highgpu-1g (1×A100-SXM4-40GB).
+# Identical to pretrain_eeg_exp45_whittle_baseline.yaml except:
+#   - devices: 1 (single GPU)
+#   - strategy: auto (no DDP)
+#   - train_batch_size: 8 (reduced for 40GB VRAM)
+#   - accumulate_grad_batches: 8 (match effective batch of 64)
+#   - max_steps: 5500 (same as 4-GPU variant)
+#   - output paths adjusted for GCP NVMe
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /home/tpavankalyan/exp45/runs/toto2_eeg_exp45_whittle_baseline
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /home/tpavankalyan/eeg_data/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 47
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: whittle
+  whittle:
+    concat_patches: true
+    spectral_weight_exponent: 0.0
+    normalize_by_freq: true
+    psd_floor: 1.0e-8
+    pinball_calibration_weight: 0.0
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 8
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+
+logging:
+  save_dir: /home/tpavankalyan/exp45/runs/lightning_logs
+  name: toto2_eeg_exp45_whittle_baseline
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp45_whittle_baseline_1xa100_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - gcp_a100
+    - exp45
+    - whittle
+    - whittle_1953
+    - probe_f_baseline
+    - mp_residual
+    - no_aux
+    - psd_prediction
+    - frequency_domain
+    - 1gpu
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /home/tpavankalyan/exp45/runs/checkpoints/toto2_eeg_exp45_whittle_baseline
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_whittle_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 500

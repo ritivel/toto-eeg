@@ -51,11 +51,13 @@ from .auxiliary_losses import (
     phase_aware_fourier_loss,
 )
 from .losses import QuantileLoss
+from .mr_mpl_loss import MRMPLLoss
 from .scheduler import WarmupStableDecayLR
+from .whittle_loss import WhittleLoss
 
 
 OptimizerName = Literal["adamw", "normuon", "dion2"]
-LossType = Literal["pinball", "amse"]
+LossType = Literal["pinball", "amse", "whittle", "mr_mpl"]
 
 
 # =====================================================================
@@ -101,6 +103,91 @@ def _merge_amse_config(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if unknown:
         raise ValueError(
             f"Unknown amse keys {sorted(unknown)!r}; expected one of {list(out)}."
+        )
+    out.update(user)
+    return out
+
+
+# =====================================================================
+# exp45 Whittle loss configuration helpers
+# =====================================================================
+#
+# Univariate Whittle pseudo-likelihood (Whittle 1953, Hannan 1973).
+# Replaces pinball with a frequency-domain Gaussian likelihood that
+# evaluates per-channel PSD prediction quality.  See ``whittle_loss.py``
+# for the math.
+#
+# The hypothesis: the Whittle NLL's per-frequency 1/S(ω) normalisation
+# forces the trunk to learn the actual spectral structure (alpha/beta/
+# gamma power, coherence) — there is no degenerate "smart causal scaler
+# + identity residual" shortcut, because matching the PSD requires
+# non-trivial frequency-domain knowledge in the FFN.
+
+_DEFAULT_WHITTLE = {
+    "concat_patches": True,           # FFT over the full S·P sequence
+    "spectral_weight_exponent": 0.0,  # 0 = uniform; 2/3 = EEG 1/f comp.
+    "normalize_by_freq": True,        # MEAN over freq bins → MSE-scale
+    "psd_floor": 1e-8,               # min PSD for log/division stability
+    "pinball_calibration_weight": 0.0, # optional small pinball term
+}
+
+
+def _merge_whittle_config(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(_DEFAULT_WHITTLE)
+    if not user:
+        return out
+    unknown = set(user) - set(out)
+    if unknown:
+        raise ValueError(
+            f"Unknown whittle keys {sorted(unknown)!r}; expected one of {list(out)}."
+        )
+    out.update(user)
+    return out
+
+
+# =====================================================================
+# exp46 MR-MPL loss configuration helpers
+# =====================================================================
+#
+# Multi-Resolution Magnitude-Phase Loss.  Replaces pinball with an
+# auraloss-style multi-resolution STFT objective that adds an explicit
+# *magnitude-weighted phase coherence* term to fix AMSE's phase-blindness
+# (exp43 stalled at coh_mean = 0.19).  See ``mr_mpl_loss.py`` for the
+# math; the lightning module just plumbs the config through.
+#
+# Hypothesis: a per-(time, frequency)-bin phase loss that is weighted by
+# ground-truth power lets the model jointly match amplitudes AND phases
+# at multiple time-frequency scales — exactly the failure mode of
+# whole-sequence spectral losses (AMSE, FACL, Whittle).
+
+_DEFAULT_MR_MPL = {
+    # STFT scales — defaults are tuned for HBN-EEG @ 500 Hz, 4096-sample
+    # sequences.  Short window catches gamma/beta with good time
+    # localisation; long window catches delta/theta with good frequency
+    # resolution.
+    "fft_sizes": (64, 256, 1024),
+    "hop_sizes": (16, 64, 256),
+    "win_sizes": None,           # None → defaults to fft_sizes
+    "alpha_lm": 1.0,             # log-magnitude L1 weight (perceptual amp)
+    "beta_sc": 0.5,              # spectral convergence weight (raw amp shape)
+    "gamma_pc": 1.0,             # magnitude-weighted phase coherence weight
+    "pinball_calibration_weight": 0.05,  # small pinball term keeps the off-
+                                         # median quantile knots calibrated;
+                                         # 0.0 = pure MR-MPL.  exp46 uses 0.05
+                                         # by default since the off-median
+                                         # knots' calibration matters for
+                                         # downstream CRPS / coverage eval.
+}
+
+
+def _merge_mr_mpl_config(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(_DEFAULT_MR_MPL)
+    if not user:
+        return out
+    unknown = set(user) - set(out)
+    if unknown:
+        raise ValueError(
+            f"Unknown mr_mpl keys {sorted(unknown)!r}; expected one of {list(out)}."
         )
     out.update(user)
     return out
@@ -240,9 +327,20 @@ class Toto2ForTraining(L.LightningModule):
           and ``amse_loss.py`` for the math.  When ``loss_type="amse"``
           the off-median quantile knots receive no direct supervision
           unless ``amse.pinball_calibration_weight > 0``.
+        * ``"whittle"`` (exp45): :class:`WhittleLoss` — univariate Whittle
+          pseudo-likelihood (Whittle 1953) on the median quantile
+          prediction.  Evaluates per-channel PSD prediction quality in
+          the frequency domain.  See ``whittle_loss.py`` for the math.
+        * ``"mr_mpl"`` (exp46): :class:`MRMPLLoss` — Multi-Resolution
+          Magnitude-Phase Loss on the median quantile prediction.
+          Combines auraloss-style multi-resolution STFT magnitude losses
+          with a magnitude-weighted phase coherence term that uses the
+          wrap-safe ``cos(θ_diff)`` form.  See ``mr_mpl_loss.py`` for the
+          math.  Designed to fix AMSE's phase-blindness (exp43 stalled
+          at coh_mean = 0.19).
 
         Pinball is always *computed* and logged as ``{stage}_pinball``
-        regardless of ``loss_type`` so we can compare new AMSE runs
+        regardless of ``loss_type`` so we can compare new runs
         against the prior pinball-trained baselines on the same scale.
     amse
         Optional dict overriding :data:`_DEFAULT_AMSE`.  Keys:
@@ -259,6 +357,34 @@ class Toto2ForTraining(L.LightningModule):
         * ``pinball_calibration_weight`` (float): if > 0, add a small
           pinball term on the side knots to keep them calibrated.
           ``0.0`` (default) is the cleanest experimental control.
+    whittle
+        Optional dict overriding :data:`_DEFAULT_WHITTLE`.  Keys:
+
+        * ``concat_patches`` (bool): see AMSE.
+        * ``spectral_weight_exponent`` (float): see AMSE.
+        * ``normalize_by_freq`` (bool): see AMSE.
+        * ``psd_floor`` (float): minimum PSD value for log/division
+          stability.  Default ``1e-8``.
+        * ``pinball_calibration_weight`` (float): see AMSE.
+    mr_mpl
+        Optional dict overriding :data:`_DEFAULT_MR_MPL`.  Keys:
+
+        * ``fft_sizes`` (sequence[int]): per-scale STFT FFT sizes.
+          Defaults to ``(64, 256, 1024)`` for HBN-EEG @ 500 Hz.
+        * ``hop_sizes`` (sequence[int]): per-scale STFT hop sizes
+          (typically ``fft_size // 4`` for 75% overlap).  Defaults to
+          ``(16, 64, 256)``.
+        * ``win_sizes`` (sequence[int] or None): per-scale window
+          lengths.  ``None`` (default) → equals ``fft_sizes``.
+        * ``alpha_lm`` (float): log-magnitude L1 weight.  Default ``1.0``.
+        * ``beta_sc`` (float): spectral convergence weight.  Default ``0.5``.
+        * ``gamma_pc`` (float): magnitude-weighted phase coherence weight.
+          Default ``1.0``.  This is the *headline* term that AMSE/Whittle
+          lack — set to ``0`` to recover an MR-STFT-magnitude-only
+          baseline (the exp31/39 ablation).
+        * ``pinball_calibration_weight`` (float): small pinball term to
+          keep off-median quantile knots calibrated.  Default ``0.05``
+          (a tiny but non-zero amount, important for downstream CRPS).
     """
 
     def __init__(
@@ -280,6 +406,8 @@ class Toto2ForTraining(L.LightningModule):
         auxiliary: Optional[Dict[str, Any]] = None,
         loss_type: LossType = "pinball",
         amse: Optional[Dict[str, Any]] = None,
+        whittle: Optional[Dict[str, Any]] = None,
+        mr_mpl: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -309,10 +437,10 @@ class Toto2ForTraining(L.LightningModule):
             )
         self.loss_fn = QuantileLoss(quantile_levels=quantile_levels, huber_kappa=huber_kappa)
 
-        # ----- exp43 AMSE loss (optional) -----
-        if loss_type not in ("pinball", "amse"):
+        # ----- exp43 AMSE / exp45 Whittle / exp46 MR-MPL loss (optional) -----
+        if loss_type not in ("pinball", "amse", "whittle", "mr_mpl"):
             raise ValueError(
-                f"loss_type must be 'pinball' or 'amse'; got {loss_type!r}"
+                f"loss_type must be one of 'pinball', 'amse', 'whittle', 'mr_mpl'; got {loss_type!r}"
             )
         self.loss_type = loss_type
         self.amse_cfg = _merge_amse_config(amse)
@@ -324,6 +452,33 @@ class Toto2ForTraining(L.LightningModule):
             )
         else:
             self.amse_loss_fn = None
+
+        # ----- exp45 Whittle loss (optional) -----
+        self.whittle_cfg = _merge_whittle_config(whittle)
+        if self.loss_type == "whittle":
+            self.whittle_loss_fn = WhittleLoss(
+                concat_patches=bool(self.whittle_cfg["concat_patches"]),
+                spectral_weight_exponent=float(self.whittle_cfg["spectral_weight_exponent"]),
+                normalize_by_freq=bool(self.whittle_cfg["normalize_by_freq"]),
+                psd_floor=float(self.whittle_cfg["psd_floor"]),
+            )
+        else:
+            self.whittle_loss_fn = None
+
+        # ----- exp46 MR-MPL loss (optional) -----
+        self.mr_mpl_cfg = _merge_mr_mpl_config(mr_mpl)
+        if self.loss_type == "mr_mpl":
+            ws = self.mr_mpl_cfg["win_sizes"]
+            self.mr_mpl_loss_fn = MRMPLLoss(
+                fft_sizes=tuple(self.mr_mpl_cfg["fft_sizes"]),
+                hop_sizes=tuple(self.mr_mpl_cfg["hop_sizes"]),
+                win_sizes=tuple(ws) if ws is not None else None,
+                alpha_lm=float(self.mr_mpl_cfg["alpha_lm"]),
+                beta_sc=float(self.mr_mpl_cfg["beta_sc"]),
+                gamma_pc=float(self.mr_mpl_cfg["gamma_pc"]),
+            )
+        else:
+            self.mr_mpl_loss_fn = None
 
         # Optimizer / schedule hyperparameters
         self.base_lr = float(base_lr)
@@ -389,6 +544,7 @@ class Toto2ForTraining(L.LightningModule):
             "auxiliary": self.aux_cfg,
             "loss_type": self.loss_type,
             "amse": self.amse_cfg,
+            "whittle": self.whittle_cfg,
         }
         self.save_hyperparameters(hparams)
 
@@ -720,10 +876,10 @@ class Toto2ForTraining(L.LightningModule):
         # Compute pinball loss only over patches that have any observed
         # target steps; further weight by per-step observation mask.
         # quantiles[..., n_patches, P] aligns 1:1 with asinh_gt[..., n_patches, P].
-        # We always compute pinball, even under loss_type="amse", so it can be
-        # logged for cross-comparison with prior baselines (it just doesn't
-        # backprop in the AMSE case unless pinball_calibration_weight > 0).
-        if self.loss_type == "amse":
+        # We always compute pinball, even under loss_type="amse"/"whittle", so
+        # it can be logged for cross-comparison with prior baselines (it just
+        # doesn't backprop unless pinball_calibration_weight > 0).
+        if self.loss_type in ("amse", "whittle"):
             with torch.no_grad():
                 pinball_loss = self.loss_fn(
                     quantiles,
@@ -738,13 +894,6 @@ class Toto2ForTraining(L.LightningModule):
             )
 
         # ----- exp43 AMSE primary loss (when enabled) ---------------------
-        # Replaces pinball with a spectrally-decomposed loss (Subich et al.,
-        # ICML 2025) on the *median* quantile prediction.  See ``amse_loss.py``
-        # for the math; in short:
-        #   AMSE(x, y) = Σ_k (√PSD_k(x) − √PSD_k(y))² + 2·max(PSD_k(x), PSD_k(y))·(1 − Coh_k)
-        # which separates amplitude error from phase error so the model can't
-        # win by smoothing.  Tests the hypothesis that pinball's amplitude/
-        # phase entanglement drives the v2/v3 trunk-collapse pathology.
         amse_log: Dict[str, torch.Tensor] = {}
         if self.loss_type == "amse":
             median_idx = self._knot_indices_for(0.5)[0]
@@ -759,9 +908,6 @@ class Toto2ForTraining(L.LightningModule):
             total_loss = amse_loss_value
             calib_w = float(self.amse_cfg["pinball_calibration_weight"])
             if calib_w > 0.0:
-                # Re-compute pinball with grad so the side-knot calibration term
-                # contributes to the optimizer step.  Replaces the no_grad call
-                # above for the "hybrid AMSE + small pinball" recipe.
                 pinball_loss_with_grad = self.loss_fn(
                     quantiles,
                     asinh_gt,
@@ -772,7 +918,44 @@ class Toto2ForTraining(L.LightningModule):
             amse_log["amse"] = amse_loss_value.detach()
             for k, v in amse_diags.items():
                 amse_log[k] = v
-        else:
+
+        # ----- exp45 Whittle primary loss (when enabled) ------------------
+        # Univariate Whittle pseudo-likelihood (Whittle 1953) on the *median*
+        # quantile prediction.  The model's predicted signal implies a PSD
+        # S(ω) = |FFT(pred)|²; the Whittle NLL evaluates how well that PSD
+        # explains the observed periodogram I(ω) = |FFT(target)|²:
+        #
+        #   L_Whittle = Σ_k [log S(ω_k) + I(ω_k) / S(ω_k)]
+        #
+        # The 1/S(ω) weighting forces the trunk to learn frequency-domain
+        # structure — there is no smooth-everything shortcut because
+        # under-predicting PSD at any frequency is penalised by I/S → ∞.
+        whittle_log: Dict[str, torch.Tensor] = {}
+        if self.loss_type == "whittle":
+            median_idx = self._knot_indices_for(0.5)[0]
+            median_pred = quantiles[median_idx]
+            whittle_loss_value, whittle_diags = self.whittle_loss_fn(
+                pred=median_pred,
+                target=asinh_gt,
+                mask=gt_mask_per_patch,
+                patch_size=P,
+                return_diagnostics=True,
+            )
+            total_loss = whittle_loss_value
+            calib_w = float(self.whittle_cfg["pinball_calibration_weight"])
+            if calib_w > 0.0:
+                pinball_loss_with_grad = self.loss_fn(
+                    quantiles,
+                    asinh_gt,
+                    weights=gt_mask_per_patch.to(quantiles.dtype),
+                )
+                pinball_loss = pinball_loss_with_grad
+                total_loss = total_loss + calib_w * pinball_loss_with_grad
+            whittle_log["whittle"] = whittle_loss_value.detach()
+            for k, v in whittle_diags.items():
+                whittle_log[k] = v
+
+        if self.loss_type == "pinball":
             total_loss = pinball_loss
 
         # ---- exp27 auxiliary losses ----
@@ -884,16 +1067,28 @@ class Toto2ForTraining(L.LightningModule):
                 batch_size=target.shape[0],
             )
 
-        # AMSE diagnostics — logged every step when AMSE is enabled (both train
-        # and val).  These let us see at a glance whether the spectral
-        # decomposition is producing the intended signal (amp_term ≈ 0 means
-        # the model has the right amplitudes; coh_term ≈ 0 means it has the
-        # right phases; amp_ratio ≈ 1 means the spectrum magnitude matches).
+        # AMSE diagnostics — logged every step when AMSE is enabled.
         for k, v in amse_log.items():
             self.log(
                 f"{stage}_{k}",
                 v,
                 prog_bar=(k == "amse"),
+                on_step=stage == "train",
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=target.shape[0],
+            )
+
+        # Whittle diagnostics — logged every step when Whittle is enabled.
+        # ``whittle_psd_ratio`` ≈ 1 means the model's predicted spectrum
+        # matches the target; ``whittle_log_ratio`` ≈ 0 is the log version.
+        # ``whittle_log_term_mean`` and ``whittle_ratio_term_mean`` decompose
+        # the loss into its two components.
+        for k, v in whittle_log.items():
+            self.log(
+                f"{stage}_{k}",
+                v,
+                prog_bar=(k == "whittle"),
                 on_step=stage == "train",
                 on_epoch=True,
                 sync_dist=True,

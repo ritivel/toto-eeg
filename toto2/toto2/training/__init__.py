@@ -11,6 +11,7 @@ modules required to pre-train Toto 2.0 from scratch on new domains
 """
 
 from .amse_loss import AMSELoss, amse_loss_1d
+from .whittle_loss import WhittleLoss, whittle_loss_1d
 from .auxiliary_losses import (
     JEPAHead,
     MultiResolutionSTFTAuxLoss,
@@ -54,4 +55,7 @@ __all__ = [
     # exp43 AMSE primary loss (Subich et al., ICML 2025)
     "AMSELoss",
     "amse_loss_1d",
+    # exp45 Whittle pseudo-likelihood (Whittle 1953)
+    "WhittleLoss",
+    "whittle_loss_1d",
 ]
