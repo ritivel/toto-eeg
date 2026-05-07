@@ -23,11 +23,13 @@ pytest.importorskip("lightning")
 
 from toto2.configuration import Toto2ModelConfig  # noqa: E402
 from toto2.training import (  # noqa: E402
+    AMSELoss,
     ArrayTimeSeriesDataset,
     QuantileLoss,
     SlidingWindowConfig,
     TimeSeriesDataModule,
     Toto2ForTraining,
+    amse_loss_1d,
     quantile_loss,
 )
 
@@ -74,6 +76,138 @@ def test_quantile_loss_module_with_weights():
     loss = head(preds, targets, weights=weights)
     assert torch.isfinite(loss)
     assert loss.ndim == 0
+
+
+# ----------------------------------------------------------------------
+# AMSE loss (Subich et al. ICML 2025, exp43)
+# ----------------------------------------------------------------------
+
+
+def test_amse_zero_at_perfect_prediction_concat():
+    """AMSE(x, x) must be ~zero — global optimum is unique (paper §2.3).
+
+    Allows a small fp32 slack because the orthonormal rfft round-trip
+    introduces ~1e-6 noise on randn inputs of unit variance.
+    """
+    torch.manual_seed(0)
+    pred = torch.randn(2, 3, 4, 16)  # (B, V, S, P)
+    loss = amse_loss_1d(pred, pred.clone(), concat_patches=True)
+    assert torch.isfinite(loss)
+    assert loss.abs() < 1e-4, f"AMSE(x,x)={loss.item():.3e} should be ~0"
+
+
+def test_amse_zero_at_perfect_prediction_per_patch():
+    """Same as above but with per-patch FFT."""
+    torch.manual_seed(0)
+    pred = torch.randn(2, 3, 4, 16)
+    loss = amse_loss_1d(pred, pred.clone(), concat_patches=False)
+    assert loss.abs() < 1e-4
+
+
+def test_amse_close_to_mse_near_optimum():
+    """AMSE matches MSE near the optimum — same Taylor expansion (paper §2.3)."""
+    torch.manual_seed(0)
+    target = torch.randn(2, 3, 4, 16)
+    # Tiny perturbation: pred ≈ target + 0.01*ε.  AMSE / MSE ratio should
+    # be very close to 1 (the paper proves they have the same Taylor expansion
+    # to second order around the optimum).
+    pred = target + 0.01 * torch.randn_like(target)
+    amse = amse_loss_1d(pred, target, concat_patches=True)
+    # Reference MSE in the spectral sense (Σ_k |α_x − α_y|², orthonormal FFT).
+    fft_pred = torch.fft.rfft(pred.flatten(start_dim=2), dim=-1, norm="ortho")
+    fft_gt = torch.fft.rfft(target.flatten(start_dim=2), dim=-1, norm="ortho")
+    spectral_mse = (fft_pred - fft_gt).abs().pow(2).sum(dim=-1).mean()
+    # 5% slack — they are exactly equal in the Taylor limit but with finite
+    # perturbation there is a tiny difference from the max-vs-geom-mean
+    # cross-term split.
+    rel_err = ((amse - spectral_mse).abs() / spectral_mse.clamp_min(1e-9)).item()
+    assert rel_err < 0.05, f"AMSE/MSE near optimum should match: {amse.item():.3e} vs {spectral_mse.item():.3e}"
+
+
+def test_amse_amplitude_only_error_uses_only_amp_term():
+    """Amplitude-only mismatch (predict half the signal, same phase) should
+    leave coh ≈ 1 and put all the loss in the amplitude term."""
+    torch.manual_seed(0)
+    target = torch.randn(2, 3, 4, 16)
+    pred = target * 0.5  # exact same phase, half amplitude
+    _, diags = amse_loss_1d(
+        pred, target, concat_patches=True, return_diagnostics=True
+    )
+    # Coherence should be exactly 1 (predictions are scalar multiple of target).
+    assert diags["amse_coh_mean"].item() == pytest.approx(1.0, abs=1e-5)
+    # Coherence term must therefore be ~0; amplitude term carries the loss.
+    assert diags["amse_coh_term"].item() == pytest.approx(0.0, abs=1e-5)
+    assert diags["amse_amp_term"].item() > 0
+    # Amplitude ratio should be ~0.5.
+    assert diags["amse_amp_ratio"].item() == pytest.approx(0.5, abs=1e-3)
+
+
+def test_amse_phase_only_error_uses_only_coh_term():
+    """Phase-only mismatch (sign flip) should leave amplitudes equal and put
+    all the loss in the coherence term."""
+    torch.manual_seed(0)
+    target = torch.randn(2, 3, 4, 16)
+    pred = -target  # same magnitude, phase flipped by π
+    _, diags = amse_loss_1d(
+        pred, target, concat_patches=True, return_diagnostics=True
+    )
+    # Amplitudes are equal: amplitude term = (|x| − |y|)² = 0.
+    assert diags["amse_amp_term"].item() == pytest.approx(0.0, abs=1e-5)
+    # Coherence is -1 (perfect anti-correlation), so coh_term = 2*max·(1−(−1)) = 4*max.
+    assert diags["amse_coh_mean"].item() == pytest.approx(-1.0, abs=1e-5)
+    assert diags["amse_coh_term"].item() > 0
+    assert diags["amse_amp_ratio"].item() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_amse_module_with_mask():
+    """AMSELoss module wrapper respects the observation mask."""
+    head = AMSELoss(concat_patches=True, spectral_weight_exponent=0.0)
+    pred = torch.randn(2, 3, 4, 16)
+    target = torch.randn(2, 3, 4, 16)
+    mask = torch.ones(2, 3, 4, 16, dtype=torch.bool)
+    mask[..., -1, :] = False  # mask the last patch entirely
+    loss = head(pred, target, mask=mask, patch_size=16)
+    assert torch.isfinite(loss)
+    assert loss.ndim == 0
+    assert loss.item() > 0
+
+
+def test_amse_loss_decreases_with_gradient_step():
+    """One Adam step on a single linear layer must strictly decrease AMSE.
+
+    Pre-flight sanity check: confirms the loss is differentiable, has
+    well-shaped gradients, and produces a usable optimization signal.
+    """
+    torch.manual_seed(0)
+    B, V, S, P = 2, 3, 4, 32
+    target = torch.randn(B, V, S, P)
+    # A trivial "model": one linear layer over the trailing P axis.
+    layer = torch.nn.Linear(P, P, bias=True)
+    opt = torch.optim.Adam(layer.parameters(), lr=5e-3)
+    losses = []
+    for _ in range(20):
+        opt.zero_grad()
+        # Feed the target itself into the layer; the model has to learn
+        # the identity to drive AMSE to zero.
+        pred = layer(target)
+        loss = amse_loss_1d(pred, target, concat_patches=True)
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.item()))
+    assert losses[-1] < losses[0] * 0.5, f"AMSE should drop ≥ 50% in 20 steps; got {losses}"
+    # No NaN / Inf along the way.
+    assert all(math.isfinite(x) for x in losses)
+
+
+def test_amse_spectral_weight_changes_loss_value():
+    """A non-zero spectral weight exponent must produce a different loss
+    than the uniform default."""
+    torch.manual_seed(0)
+    pred = torch.randn(2, 3, 4, 32)
+    target = torch.randn(2, 3, 4, 32)
+    loss_uniform = amse_loss_1d(pred, target, spectral_weight_exponent=0.0)
+    loss_eeg = amse_loss_1d(pred, target, spectral_weight_exponent=2 / 3)
+    assert loss_uniform != loss_eeg
 
 
 # ----------------------------------------------------------------------

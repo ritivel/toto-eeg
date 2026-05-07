@@ -1,0 +1,208 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp43 AMSE on the NORMAL baseline (no auxiliaries).
+#
+# Tests the user's hypothesis:
+#
+#   "Is the trunk collapse caused by pinball's amplitude/phase
+#    entanglement?  AMSE (Subich et al., ICML 2025, arXiv:2501.19374)
+#    decomposes spectral error into amplitude + phase."
+#
+# This is exp43 in the experiments table — the *baseline* arm (no
+# auxiliary supervision).  The companion arm with JEPA+AAMP+PARS still
+# active lives in pretrain_eeg_exp44_amse_triple.yaml.
+#
+# WHAT CHANGES vs. exp26 Probe F (val_loss=0.1838 baseline)
+# ---------------------------------------------------------
+# Only the supervision objective: pinball -> AMSE on the median knot.
+# Everything else — trunk architecture (mp_residual, qk_norm, 24M
+# d_model=384x12), data pipeline, optimizer (AdamW, base_lr=0.3, wd=0),
+# precision (32-true), schedule (WSD), seed conventions — matches the
+# Probe F recipe so the comparison is unambiguous.
+#
+# AMSE intuition
+# --------------
+# Pinball has an amplitude/phase entanglement: it can be minimised by
+# (a) shrinking amplitude when phase is hard to predict (the "double
+# penalty" smoothing pathology) or (b) actually getting both right.  In
+# the v2/v3 trunk-collapse pattern the FFN underflows and the model
+# wins via (a).  AMSE separates the two error sources:
+#
+#     AMSE(x, y) = sum_k (sqrt(PSD_k(x)) - sqrt(PSD_k(y)))^2
+#                + sum_k 2 * max(PSD_k(x), PSD_k(y)) * (1 - Coh_k(x, y))
+#
+# Term 1 is amplitude error; term 2 is phase / coherence error.  The
+# gradient of -AMSE always points toward both PSD_k(x) -> PSD_k(y)
+# and Coh_k -> 1, so smoothing fine scales (route a) is no longer a
+# locally-optimal escape.
+#
+# DECISION RULE (after 5500 steps + ridge probe on TUAB)
+# ------------------------------------------------------
+# Decision A: TUAB AUROC >= Probe F + 0.01 AND FFN weight RMS >= 1e-3
+#             across all layers AND val_amse decreases monotonically
+#             -> pinball *is* the primary driver of trunk collapse.
+#                Promote AMSE to the new baseline; rerun exp44 (AMSE +
+#                triple aux) for the new production checkpoint.
+# Decision B: TUAB AUROC < Probe F + 0.01 OR FFN still collapses
+#             -> pinball is NOT the dominant cause; the loss split
+#                doesn't help at this scale.  Pivot to target-shape
+#                experiments (VQ tokenizer, exp44 alternative).
+#
+# DIAGNOSTICS (read in WandB / TB during training)
+# ------------------------------------------------
+# - train_amse / val_amse:        the new primary loss
+# - train_amse_amp_term / coh_term: per-frequency amplitude vs phase split
+# - train_amse_amp_ratio:         predicted/truth spectrum magnitude ratio
+#                                 (~1 = healthy; <1 = still smoothing)
+# - train_amse_coh_mean:          mean coherence across frequencies
+# - train_pinball / val_pinball:  always computed for direct
+#                                 cross-comparison with prior runs
+# - val_trunk_rms / val_trunk_eff_rank_ratio / val_trunk_anisotropy:
+#                                 the canonical trunk-health probes
+# - train_knot_spread:            quantile knots' spread (collapse to ~0
+#                                 means the head has gone trivial)
+#
+# WALL-CLOCK on 4xH100 SXM5 80GB at precision: 32-true
+# ----------------------------------------------------
+# Same as exp36 Probe F: ~0.6-0.8 s/step.  AMSE adds one rfft +
+# back-pass per step -- negligible cost on 4096-sample patched
+# sequences.  5500 steps -> ~75 minutes wall-clock.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp43_amse_baseline
+
+# --------------------------------------------------------------------
+# Model — same as exp26 Probe F (mp_residual baseline)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0                    # ignored when mp_residual=true
+  residual_attn_ratio: 1.0              # ignored when mp_residual=true
+  sigma_reparam: false
+  mp_residual: true                     # exp26 winning recipe
+  mp_residual_alpha: 1.0
+
+# --------------------------------------------------------------------
+# Data — same as exp36 (HBN-EEG, no outer transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp36 recipe + exp43 AMSE primary loss
+# --------------------------------------------------------------------
+training:
+  seed: 46                              # different from exp33-36 series
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0                     # exp25 Probe C / exp26 Probe F
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                     # only used if loss_type=pinball;
+                                        # AMSE ignores it but harmless to keep
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  # ---------- exp43 AMSE supervision ----------
+  loss_type: amse
+  amse:
+    concat_patches: true                # FFT over the full 4096-sample
+                                        # sequence (covers delta/theta/alpha/
+                                        # beta/gamma).  Set false to revert
+                                        # to per-patch FFT (loses delta/theta
+                                        # coverage but matches pinball's
+                                        # per-patch granularity).
+    spectral_weight_exponent: 0.0       # 0 = uniform (vanilla AMSE).
+                                        # 0.667 = (1+omega)^(2/3) EEG 1/f
+                                        # bias correction; not enabled in
+                                        # this principled control run.
+    pinball_calibration_weight: 0.0     # pure AMSE; no pinball calibration
+                                        # term on the side knots.  exp43
+                                        # tests AMSE in isolation; if the
+                                        # off-median knots collapse we will
+                                        # add a small (~0.05) calibration
+                                        # term in a follow-up.
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp43_amse_baseline
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp43_amse_baseline_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp43
+    - amse
+    - subich_2025
+    - probe_f_baseline
+    - mp_residual
+    - no_aux
+    - trunk_collapse_test
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp43_amse_baseline
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_amse_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 500

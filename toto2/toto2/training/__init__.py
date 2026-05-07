@@ -10,6 +10,7 @@ modules required to pre-train Toto 2.0 from scratch on new domains
 (e.g., EEG signals).
 """
 
+from .amse_loss import AMSELoss, amse_loss_1d
 from .auxiliary_losses import (
     JEPAHead,
     MultiResolutionSTFTAuxLoss,
@@ -50,4 +51,7 @@ __all__ = [
     "online_denoise_target",
     "phase_aware_fourier_loss",
     "sigreg_loss",
+    # exp43 AMSE primary loss (Subich et al., ICML 2025)
+    "AMSELoss",
+    "amse_loss_1d",
 ]

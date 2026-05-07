@@ -1,0 +1,147 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp43 AMSE baseline SMOKE (pre-flight check, ~10 min).
+#
+# A short version of pretrain_eeg_exp43_amse_baseline.yaml whose ONLY
+# purpose is to verify the AMSE training loop is healthy on the AWS box
+# BEFORE committing GPU-hours to the full 5500-step run.
+#
+# SUCCESS CRITERIA (record against pre-registered hypotheses)
+# -----------------------------------------------------------
+# A. train_amse and val_amse are both monotonically decreasing through
+#    the 500-step plateau check (smooth, not noisy / flat / increasing).
+# B. train_amse_amp_term and train_amse_coh_term are both > 0 and
+#    moving in the same direction as train_amse (i.e., the model is
+#    actually working on both halves of the loss).
+# C. train_amse_amp_ratio is in [0.3, 2.0] (sanity: spectrum is in the
+#    right ballpark, not 1e-3 or 1e3).
+# D. train_amse_coh_mean is in [-0.1, 1.0] (sanity: not stuck near -1
+#    which would mean the model phase-flipped everything).
+# E. grad_norm > 1e-3 across the run (not vanishing).
+# F. NO NaN / Inf in any logged value.
+# G. Wall-clock < 15 min on 4xH100 SXM5 80GB at precision: 32-true.
+#
+# IF any of A-G fails, do NOT relaunch the full run.  Either drop in
+# pinball_calibration_weight=0.05 (config flag in the loss block) or
+# disable AMSE and pivot to the alternative experiment.
+#
+# Differences from `pretrain_eeg_exp43_amse_baseline.yaml`:
+#   - max_steps          5500 -> 500
+#   - warmup_steps        200 -> 50
+#   - stable_steps       5000 -> 400
+#   - decay_steps         300 -> 50
+#   - val_check_interval  500 -> 100
+#   - every_n_train_steps 500 -> 250
+#   - log_every_n_steps    25 -> 10
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp43_amse_baseline_smoke
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 46
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 50
+  stable_steps: 400
+  decay_steps: 50
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: amse
+  amse:
+    concat_patches: true
+    spectral_weight_exponent: 0.0
+    pinball_calibration_weight: 0.0
+
+trainer:
+  max_steps: 500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  val_check_interval: 100
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 10
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp43_amse_baseline_smoke
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp43_amse_baseline_smoke_500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp43
+    - amse
+    - smoke
+    - preflight
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp43_amse_baseline_smoke
+  filename: "{epoch}-{step}-{val_loss:.4f}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 1
+  save_last: true
+  every_n_train_steps: 250

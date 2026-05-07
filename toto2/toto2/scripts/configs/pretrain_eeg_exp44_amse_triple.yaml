@@ -1,0 +1,171 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp44 AMSE on the TRIPLE (JEPA + AAMP + PARS) recipe.
+#
+# Companion to exp43.  Same supervision swap (pinball -> AMSE on the
+# median knot) but layered on top of the exp36 production recipe with
+# all three auxiliary losses still active.  Tests whether AMSE is
+# *additive* with the trunk-occupying auxiliaries, or whether it
+# competes with them for the FFN's representational capacity.
+#
+# WHAT CHANGES vs. exp36 (val_loss=0.1384, the production checkpoint)
+# -------------------------------------------------------------------
+# Only the supervision objective: pinball -> AMSE.  Architecture
+# (mp_residual, qk_norm, 24M @ d_model=384x12), data, optimizer
+# (AdamW, base_lr=0.3, wd=0), aux losses (JEPA + AAMP + PARS at exp36
+# weights), schedule, precision -- all match exp36.
+#
+# DECISION RULE (after 30000 steps + ridge probe on TUAB)
+# -------------------------------------------------------
+# Decision A: TUAB AUROC >= exp36 + 0.01 OR val_loss <= exp36 - 0.005
+#             -> AMSE composes with the auxiliaries.  Promote to new
+#                production recipe; rerun downstream eval suite.
+# Decision B: Worse than exp36 on both axes -> AMSE competes with
+#             the auxiliaries (likely because JEPA + AAMP + PARS
+#             already supply the spectral information AMSE encodes).
+#             Drop AMSE from the triple recipe; the exp43 baseline
+#             arm still settles the underlying hypothesis.
+#
+# RESOURCE BUDGET
+# ---------------
+# 30k steps on 4xH100 SXM5 80GB at precision: 32-true, batch 12,
+# triple aux = ~10 hours wall-clock (matches exp36).  Launch ONLY
+# after the exp43 baseline + smoke have shown a healthy AMSE loss
+# trajectory; otherwise we spend 10 GPU-hours debugging a loss bug.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp44_amse_triple
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12                  # exp36's smaller batch (aux memory)
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 47                              # different from exp36 (45) and exp43 (46)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 27000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  # ---------- exp43/44 AMSE supervision ----------
+  loss_type: amse
+  amse:
+    concat_patches: true
+    spectral_weight_exponent: 0.0
+    pinball_calibration_weight: 0.0
+
+  # ---------- exp36 triple auxiliary supervision (unchanged) ----------
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+
+trainer:
+  max_steps: 30000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp44_amse_triple
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp44_amse_triple_30k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp44
+    - amse
+    - subich_2025
+    - triple_aux
+    - jepa
+    - aamp
+    - pars
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp44_amse_triple
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_amse_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500

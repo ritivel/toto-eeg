@@ -41,6 +41,7 @@ import dd_unit_scaling as uu
 
 from ..configuration import Toto2ModelConfig
 from ..model import Toto2Model
+from .amse_loss import AMSELoss
 from .auxiliary_losses import (
     JEPAHead,
     MultiResolutionSTFTAuxLoss,
@@ -54,6 +55,47 @@ from .scheduler import WarmupStableDecayLR
 
 
 OptimizerName = Literal["adamw", "normuon", "dion2"]
+LossType = Literal["pinball", "amse"]
+
+
+# =====================================================================
+# exp43 AMSE loss configuration helpers
+# =====================================================================
+#
+# AMSE (Subich et al. ICML 2025, arXiv:2501.19374) replaces the pinball
+# loss with a spectrally-decomposed alternative that separates amplitude
+# error from phase / coherence error.  See ``amse_loss.py`` for the
+# math; the lightning module just plumbs the config through.
+#
+# The hypothesis we test is whether the v2/v3 trunk-collapse pathology
+# (FFN weights underflow, val_pinball stays low because the head learns
+# a smart causal-scaler shortcut) is driven by pinball's inability to
+# distinguish amplitude smoothing from phase error.  AMSE makes the two
+# error sources independent so the gradient cannot win by smoothing.
+
+
+_DEFAULT_AMSE = {
+    "concat_patches": True,           # FFT over the full S·P sequence
+    "spectral_weight_exponent": 0.0,  # 0 = uniform; 2/3 = EEG 1/f comp.
+    "pinball_calibration_weight": 0.0,  # optional small pinball term to
+                                        # keep the off-median knots
+                                        # calibrated; 0 = pure AMSE
+                                        # (recommended for the principled
+                                        # exp43 ablation).
+}
+
+
+def _merge_amse_config(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(_DEFAULT_AMSE)
+    if not user:
+        return out
+    unknown = set(user) - set(out)
+    if unknown:
+        raise ValueError(
+            f"Unknown amse keys {sorted(unknown)!r}; expected one of {list(out)}."
+        )
+    out.update(user)
+    return out
 
 
 # =====================================================================
@@ -179,6 +221,36 @@ class Toto2ForTraining(L.LightningModule):
         EEG to suppress kink-driven gradient noise at very small errors.
     log_grad_norm
         If ``True``, log the global L2 grad norm before each optimizer step.
+    loss_type
+        Primary supervision objective.
+
+        * ``"pinball"`` (default, Toto-2 baseline): mean pinball loss
+          across the 9 quantile knots in asinh-scaled space.
+        * ``"amse"`` (exp43): :class:`AMSELoss` on the *median* quantile
+          prediction (deterministic point forecast in asinh-scaled
+          space).  See :data:`_DEFAULT_AMSE` for the configurable knobs
+          and ``amse_loss.py`` for the math.  When ``loss_type="amse"``
+          the off-median quantile knots receive no direct supervision
+          unless ``amse.pinball_calibration_weight > 0``.
+
+        Pinball is always *computed* and logged as ``{stage}_pinball``
+        regardless of ``loss_type`` so we can compare new AMSE runs
+        against the prior pinball-trained baselines on the same scale.
+    amse
+        Optional dict overriding :data:`_DEFAULT_AMSE`.  Keys:
+
+        * ``concat_patches`` (bool): concatenate the ``S`` predicted
+          patches into a single 1-D signal per recording before FFT.
+          ``True`` (default) gives full frequency-range coverage; the
+          alternative ``False`` runs per-patch FFT and matches pinball's
+          per-patch granularity but loses delta/theta on EEG.
+        * ``spectral_weight_exponent`` (float): per-frequency weight
+          ``S(k) = (1+k)^exp``.  ``0.0`` (default) is uniform; ``2/3``
+          is the EEG 1/f bias correction discussed in the abandoned
+          exp43 spec.
+        * ``pinball_calibration_weight`` (float): if > 0, add a small
+          pinball term on the side knots to keep them calibrated.
+          ``0.0`` (default) is the cleanest experimental control.
     """
 
     def __init__(
@@ -198,6 +270,8 @@ class Toto2ForTraining(L.LightningModule):
         huber_kappa: float = 0.0,
         log_grad_norm: bool = True,
         auxiliary: Optional[Dict[str, Any]] = None,
+        loss_type: LossType = "pinball",
+        amse: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -217,13 +291,30 @@ class Toto2ForTraining(L.LightningModule):
                 f"got context_length={self.context_length}, patch_size={self.model.config.patch_size}."
             )
 
-        # Quantile loss (matches the head's quantile knots)
+        # Quantile loss (matches the head's quantile knots) — kept around even
+        # when ``loss_type == "amse"`` so we can always log ``{stage}_pinball``
+        # for cross-comparison with prior pinball-trained baselines.
         if list(quantile_levels) != list(self.model.output_head.knots):
             raise ValueError(
                 "quantile_levels must match the model output head knots: "
                 f"got {list(quantile_levels)}, head expects {self.model.output_head.knots}."
             )
         self.loss_fn = QuantileLoss(quantile_levels=quantile_levels, huber_kappa=huber_kappa)
+
+        # ----- exp43 AMSE loss (optional) -----
+        if loss_type not in ("pinball", "amse"):
+            raise ValueError(
+                f"loss_type must be 'pinball' or 'amse'; got {loss_type!r}"
+            )
+        self.loss_type = loss_type
+        self.amse_cfg = _merge_amse_config(amse)
+        if self.loss_type == "amse":
+            self.amse_loss_fn = AMSELoss(
+                concat_patches=bool(self.amse_cfg["concat_patches"]),
+                spectral_weight_exponent=float(self.amse_cfg["spectral_weight_exponent"]),
+            )
+        else:
+            self.amse_loss_fn = None
 
         # Optimizer / schedule hyperparameters
         self.base_lr = float(base_lr)
@@ -287,6 +378,8 @@ class Toto2ForTraining(L.LightningModule):
             "quantile_levels": list(quantile_levels),
             "model_config": asdict(self.model.config),
             "auxiliary": self.aux_cfg,
+            "loss_type": self.loss_type,
+            "amse": self.amse_cfg,
         }
         self.save_hyperparameters(hparams)
 
@@ -618,8 +711,60 @@ class Toto2ForTraining(L.LightningModule):
         # Compute pinball loss only over patches that have any observed
         # target steps; further weight by per-step observation mask.
         # quantiles[..., n_patches, P] aligns 1:1 with asinh_gt[..., n_patches, P].
-        pinball_loss = self.loss_fn(quantiles, asinh_gt, weights=gt_mask_per_patch.to(quantiles.dtype))
-        total_loss = pinball_loss
+        # We always compute pinball, even under loss_type="amse", so it can be
+        # logged for cross-comparison with prior baselines (it just doesn't
+        # backprop in the AMSE case unless pinball_calibration_weight > 0).
+        if self.loss_type == "amse":
+            with torch.no_grad():
+                pinball_loss = self.loss_fn(
+                    quantiles,
+                    asinh_gt,
+                    weights=gt_mask_per_patch.to(quantiles.dtype),
+                )
+        else:
+            pinball_loss = self.loss_fn(
+                quantiles,
+                asinh_gt,
+                weights=gt_mask_per_patch.to(quantiles.dtype),
+            )
+
+        # ----- exp43 AMSE primary loss (when enabled) ---------------------
+        # Replaces pinball with a spectrally-decomposed loss (Subich et al.,
+        # ICML 2025) on the *median* quantile prediction.  See ``amse_loss.py``
+        # for the math; in short:
+        #   AMSE(x, y) = Σ_k (√PSD_k(x) − √PSD_k(y))² + 2·max(PSD_k(x), PSD_k(y))·(1 − Coh_k)
+        # which separates amplitude error from phase error so the model can't
+        # win by smoothing.  Tests the hypothesis that pinball's amplitude/
+        # phase entanglement drives the v2/v3 trunk-collapse pathology.
+        amse_log: Dict[str, torch.Tensor] = {}
+        if self.loss_type == "amse":
+            median_idx = self._knot_indices_for(0.5)[0]
+            median_pred = quantiles[median_idx]  # (B, V, S, P) in asinh-scaled space
+            amse_loss_value, amse_diags = self.amse_loss_fn(
+                pred=median_pred,
+                target=asinh_gt,
+                mask=gt_mask_per_patch,
+                patch_size=P,
+                return_diagnostics=True,
+            )
+            total_loss = amse_loss_value
+            calib_w = float(self.amse_cfg["pinball_calibration_weight"])
+            if calib_w > 0.0:
+                # Re-compute pinball with grad so the side-knot calibration term
+                # contributes to the optimizer step.  Replaces the no_grad call
+                # above for the "hybrid AMSE + small pinball" recipe.
+                pinball_loss_with_grad = self.loss_fn(
+                    quantiles,
+                    asinh_gt,
+                    weights=gt_mask_per_patch.to(quantiles.dtype),
+                )
+                pinball_loss = pinball_loss_with_grad
+                total_loss = total_loss + calib_w * pinball_loss_with_grad
+            amse_log["amse"] = amse_loss_value.detach()
+            for k, v in amse_diags.items():
+                amse_log[k] = v
+        else:
+            total_loss = pinball_loss
 
         # ---- exp27 auxiliary losses ----
         # Each is conditionally applied if its config flag is enabled.
@@ -725,6 +870,22 @@ class Toto2ForTraining(L.LightningModule):
                 v,
                 prog_bar=False,
                 on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=target.shape[0],
+            )
+
+        # AMSE diagnostics — logged every step when AMSE is enabled (both train
+        # and val).  These let us see at a glance whether the spectral
+        # decomposition is producing the intended signal (amp_term ≈ 0 means
+        # the model has the right amplitudes; coh_term ≈ 0 means it has the
+        # right phases; amp_ratio ≈ 1 means the spectrum magnitude matches).
+        for k, v in amse_log.items():
+            self.log(
+                f"{stage}_{k}",
+                v,
+                prog_bar=(k == "amse"),
+                on_step=stage == "train",
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=target.shape[0],
