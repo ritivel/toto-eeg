@@ -46,18 +46,15 @@ data:
   drop_last: true
 
   eeg:
-    data_root: /home/tpavankalyan/eeg_data/npy
-    train_glob: "sub-*/task-*.npy"
+    data_root: /home/tpavankalyan/eeg_data/parquet
+    train_glob: "sub-*/task-*.parquet"
     val_glob: null
     val_fraction: 0.05
-    array_key: data
     sfreq: 500
     expected_channels: 129
     sliding_stride: 2048
     min_observed_frac: 0.8
-    lazy: true
-    cache_size: 2
-    windows_per_file: 64
+    concat_windows: 3
     transform:
       type: none
 
