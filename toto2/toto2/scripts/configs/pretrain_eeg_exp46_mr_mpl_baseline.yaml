@@ -1,0 +1,229 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp46 MR-MPL replaces pinball (Multi-Resolution
+# Magnitude-Phase Loss; auraloss + magnitude-weighted phase coherence).
+#
+# Designed to fix the failure mode observed in exp43 (AMSE):
+#   * AMSE got the spectrum right (val_amse_amp_ratio=0.84 final).
+#   * AMSE got the phase wrong (val_amse_coh_mean=0.19 final, stalled).
+#   * The remaining ~80% of the loss was the phase term.
+#
+# Root cause (deep research, see Notion exp46 page): single-FFT spectral
+# losses (AMSE, FACL, Whittle) compute phase coherence over the *entire*
+# 4096-sample sequence, so per-position phase information dilutes to
+# noise.  MR-MPL borrows the canonical multi-resolution STFT loss from
+# audio synthesis (HiFi-GAN, MelGAN, BigVGAN, HiFi-WaveGAN) and adds an
+# explicit *magnitude-weighted phase coherence* term using the wrap-safe
+# 1 - cos(θ_diff) form proven by 5+ years of speech enhancement
+# literature (Phase Continuity Loss arXiv:2202.11918; weighted
+# magnitude-phase loss; von Mises STFT phase Takamichi 2018).
+#
+# WHAT CHANGES vs. exp43 (AMSE on Probe F)
+# ----------------------------------------
+# Only the loss function: AMSE → MR-MPL.  Architecture (24M, mp_residual,
+# qk_norm, d_model=384x12), data (HBN-EEG ~250k 4096-sample windows @
+# 500Hz, 129 channels), optimizer (AdamW, base_lr=0.3, wd=0), schedule
+# (200/5000/300 WSD), precision (32-true) all match exp43 / Probe F.
+#
+# Math (per STFT scale m):
+#   Term 1 (log-magnitude L1):       L_lm = ||log(|X|+ε) - log(|Y|+ε)||_1
+#   Term 2 (spectral convergence):    L_sc = ||X|-|Y||_F / ||Y||_F
+#   Term 3 (phase coherence):
+#     cos_diff = Re(X · conj(Y)) / (|X|·|Y|)        ← wrap-safe form
+#     L_pc = Σ |Y|² · (1 - cos_diff) / Σ |Y|²       ← gt-power weighted
+#   L_m = α·L_lm + β·L_sc + γ·L_pc
+# L_total = mean_m L_m + λ_pinball · L_pinball
+#
+# CPU smoke-test result (60-step MLP on noisy sine):
+#   * Phase coherence pc dropped 97% (0.93 → 0.02)
+#   * cos_mean grew from 0.07 → 0.98 ← this is the key signature
+#   * No NaN / Inf, finite gradients everywhere
+# This is the behavior AMSE failed to achieve on the real model.
+#
+# DECISION RULE (after 5500 steps + ridge probe on TUAB)
+# ------------------------------------------------------
+# Decision A (AMSE was wrong; MR-MPL is the new baseline):
+#   * val_mr_mpl_cos_mean_mean > 0.4 (vs exp43's 0.19)
+#   * val_amse_amp_ratio (cross-comparison) >= 0.7 (don't lose the AMSE win)
+#   * val_pinball <= 0.4 (vs exp43's 0.81; vs Probe F's 0.18)
+#   * val_trunk_eff_rank_ratio > 0.3 (vs exp43's 0.186)
+#   * TUAB ridge AUROC >= Probe F + 0.01
+#   ⇒ Promote MR-MPL to new baseline; rerun downstream eval; explore
+#      MR-MPL + JEPA + AAMP + PARS (exp47) for the production recipe.
+#
+# Decision B (MR-MPL fixes phase but loses elsewhere):
+#   * cos_mean improves but TUAB AUROC < Probe F
+#   ⇒ Phase coherence isn't sufficient for downstream; investigate
+#      whether to re-add per-position pinball as a STRONG (not 0.05) term.
+#
+# Decision C (MR-MPL fails like AMSE):
+#   * cos_mean stalls < 0.3 AND val_pinball stays ~0.8
+#   ⇒ The phase prediction problem is architectural, not loss-driven.
+#      Pivot to architecture changes (smaller patches; phase-aware head).
+#
+# DIAGNOSTICS (read in WandB / TB during training)
+# ------------------------------------------------
+# * val_mr_mpl              — primary loss (decreasing)
+# * val_mr_mpl_cos_mean_mean — gt-power-weighted cos(θ_diff), THE phase
+#                              signal; should grow toward 1.0
+# * val_mr_mpl_amp_ratio_mean — predicted/gt amplitude ratio (~1.0)
+# * val_mr_mpl_pc_mean       — phase coherence sub-loss (decreasing)
+# * val_mr_mpl_lm_mean       — log-magnitude sub-loss (decreasing)
+# * val_mr_mpl_sc_mean       — spectral convergence sub-loss (decreasing)
+# * val_mr_mpl_*_scale0/1/2  — per-resolution breakdowns
+# * val_pinball              — always-on cross-comparison metric
+# * val_trunk_rms / eff_rank_ratio / anisotropy — trunk health probes
+# * train_knot_spread        — quantile head health
+#
+# WALL-CLOCK on 4xH100 SXM5 80GB at precision: 32-true
+# ----------------------------------------------------
+# Same as exp43: ~75 minutes for 5500 steps.  MR-MPL adds 3 STFTs +
+# elementwise math per step — negligible on 4096-sample sequences.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp46_mr_mpl_baseline
+
+# --------------------------------------------------------------------
+# Model — same as exp26 Probe F / exp43 (mp_residual baseline)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+# --------------------------------------------------------------------
+# Data — same as exp43 (HBN-EEG, no outer transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp43/Probe F recipe + exp46 MR-MPL primary loss
+# --------------------------------------------------------------------
+training:
+  seed: 48                              # different from exp43 (46), exp45 (47)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                     # only used by pinball (kept for
+                                        # off-median knot calibration term)
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  # ---------- exp46 MR-MPL supervision ----------
+  loss_type: mr_mpl
+  mr_mpl:
+    # 3 STFT scales tuned for HBN-EEG @ 500 Hz, 4096-sample sequences:
+    #   * 64 / 16 / 64    — 32 ms windows, 7.8 Hz freq res → gamma+beta,
+    #                        good time localisation
+    #   * 256 / 64 / 256  — 128 ms windows, 1.95 Hz freq res → alpha+beta,
+    #                        balanced tradeoff
+    #   * 1024 / 256 / 1024 — 512 ms windows, 0.49 Hz freq res → delta+
+    #                          theta+alpha, good frequency resolution
+    # All windows are short enough that the model only needs to predict
+    # phase within one window (not across the full 4096-sample sequence
+    # like AMSE/Whittle).  This is the architectural bet that
+    # multi-resolution windows make phase prediction tractable.
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null                     # null → defaults to fft_sizes
+    alpha_lm: 1.0                       # log-magnitude L1 (perceptual amp)
+    beta_sc:  0.5                       # spectral convergence (raw amp shape)
+    gamma_pc: 1.0                       # ← THE phase coherence term
+    pinball_calibration_weight: 0.05    # tiny pinball on side knots so
+                                        # CRPS / coverage probes still work
+                                        # downstream.  exp43 set this to 0
+                                        # and got val_quant_xings = 1.0
+                                        # (every position had quantile
+                                        # crossings = head was unusable).
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp46_mr_mpl_baseline
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp46_mr_mpl_baseline_5500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp46
+    - mr_mpl
+    - multi_resolution_stft
+    - phase_coherence
+    - hifi_gan_lineage
+    - probe_f_baseline
+    - mp_residual
+    - no_aux
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp46_mr_mpl_baseline
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 3
+  save_last: true
+  every_n_train_steps: 500

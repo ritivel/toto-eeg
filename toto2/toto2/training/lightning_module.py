@@ -545,6 +545,7 @@ class Toto2ForTraining(L.LightningModule):
             "loss_type": self.loss_type,
             "amse": self.amse_cfg,
             "whittle": self.whittle_cfg,
+            "mr_mpl": self.mr_mpl_cfg,
         }
         self.save_hyperparameters(hparams)
 
@@ -876,10 +877,10 @@ class Toto2ForTraining(L.LightningModule):
         # Compute pinball loss only over patches that have any observed
         # target steps; further weight by per-step observation mask.
         # quantiles[..., n_patches, P] aligns 1:1 with asinh_gt[..., n_patches, P].
-        # We always compute pinball, even under loss_type="amse"/"whittle", so
-        # it can be logged for cross-comparison with prior baselines (it just
+        # We always compute pinball, even under loss_type="amse"/"whittle"/"mr_mpl",
+        # so it can be logged for cross-comparison with prior baselines (it just
         # doesn't backprop unless pinball_calibration_weight > 0).
-        if self.loss_type in ("amse", "whittle"):
+        if self.loss_type in ("amse", "whittle", "mr_mpl"):
             with torch.no_grad():
                 pinball_loss = self.loss_fn(
                     quantiles,
@@ -954,6 +955,44 @@ class Toto2ForTraining(L.LightningModule):
             whittle_log["whittle"] = whittle_loss_value.detach()
             for k, v in whittle_diags.items():
                 whittle_log[k] = v
+
+        # ----- exp46 MR-MPL primary loss (when enabled) ------------------
+        # Multi-Resolution Magnitude-Phase Loss on the *median* quantile.
+        # Adds an explicit magnitude-weighted phase coherence term
+        # alongside multi-resolution STFT magnitude losses (log-magnitude
+        # L1 + spectral convergence) so the model can jointly learn
+        # amplitudes AND phases at multiple time-frequency scales.  This
+        # is the loss exp43 (AMSE) was missing — AMSE got the spectrum
+        # right but stalled at coh_mean = 0.19 because its phase
+        # coherence term is whole-sequence and time-localised phase info
+        # diluted to noise.  MR-MPL's per-(time, freq)-bin formulation
+        # (with multi-resolution STFT windows) gives the model a chance
+        # to predict phase at the timescale where the architecture can
+        # actually succeed.
+        mr_mpl_log: Dict[str, torch.Tensor] = {}
+        if self.loss_type == "mr_mpl":
+            median_idx = self._knot_indices_for(0.5)[0]
+            median_pred = quantiles[median_idx]
+            mr_mpl_loss_value, mr_mpl_diags = self.mr_mpl_loss_fn(
+                pred=median_pred,
+                target=asinh_gt,
+                mask=gt_mask_per_patch,
+                patch_size=P,
+                return_diagnostics=True,
+            )
+            total_loss = mr_mpl_loss_value
+            calib_w = float(self.mr_mpl_cfg["pinball_calibration_weight"])
+            if calib_w > 0.0:
+                pinball_loss_with_grad = self.loss_fn(
+                    quantiles,
+                    asinh_gt,
+                    weights=gt_mask_per_patch.to(quantiles.dtype),
+                )
+                pinball_loss = pinball_loss_with_grad
+                total_loss = total_loss + calib_w * pinball_loss_with_grad
+            mr_mpl_log["mr_mpl"] = mr_mpl_loss_value.detach()
+            for k, v in mr_mpl_diags.items():
+                mr_mpl_log[k] = v
 
         if self.loss_type == "pinball":
             total_loss = pinball_loss
@@ -1089,6 +1128,29 @@ class Toto2ForTraining(L.LightningModule):
                 f"{stage}_{k}",
                 v,
                 prog_bar=(k == "whittle"),
+                on_step=stage == "train",
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=target.shape[0],
+            )
+
+        # MR-MPL diagnostics — logged every step when MR-MPL is enabled.
+        # Headline metrics for cross-comparison with exp43 (AMSE):
+        #   * ``mr_mpl_cos_mean_mean``  — gt-power-weighted cos(θ_diff)
+        #     averaged across STFT scales; analogue of AMSE's coh_mean.
+        #     **THE** key metric: should grow from ~0 toward ~1 fast.
+        #   * ``mr_mpl_amp_ratio_mean`` — mean predicted/gt amplitude
+        #     ratio across STFT scales.  Should approach 1.0.
+        #   * ``mr_mpl_pc_mean``        — gt-power-weighted (1-cos diff)
+        #     averaged across scales.  Should drop toward 0.
+        #   * ``mr_mpl_lm_mean``        — log-magnitude L1 across scales.
+        #   * ``mr_mpl_sc_mean``        — spectral convergence across scales.
+        # Per-scale breakdowns are also logged as ``..._scale0/1/2``.
+        for k, v in mr_mpl_log.items():
+            self.log(
+                f"{stage}_{k}",
+                v,
+                prog_bar=(k == "mr_mpl"),
                 on_step=stage == "train",
                 on_epoch=True,
                 sync_dist=True,

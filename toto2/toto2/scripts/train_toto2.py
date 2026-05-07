@@ -157,11 +157,12 @@ def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
     # ``toto2.training.lightning_module._DEFAULT_AUX`` for shape.
     auxiliary = train_cfg.get("auxiliary")
 
-    # exp43 AMSE / exp45 Whittle: optional ``training.loss_type`` switch +
-    # ``training.amse`` / ``training.whittle`` blocks.
+    # exp43 AMSE / exp45 Whittle / exp46 MR-MPL: optional ``training.loss_type``
+    # switch + per-loss config blocks.
     loss_type = train_cfg.get("loss_type", "pinball")
     amse_cfg = train_cfg.get("amse")
     whittle_cfg = train_cfg.get("whittle")
+    mr_mpl_cfg = train_cfg.get("mr_mpl")
 
     common_kwargs = dict(
         context_length=context_length,
@@ -179,6 +180,7 @@ def build_lightning_module(cfg: Dict[str, Any]) -> Toto2ForTraining:
         loss_type=loss_type,
         amse=amse_cfg,
         whittle=whittle_cfg,
+        mr_mpl=mr_mpl_cfg,
     )
 
     model_kwargs = _model_kwargs_from_config(cfg)
