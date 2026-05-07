@@ -1,0 +1,146 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp40 QUAD: triple aux + PHASE spectral supervision.
+#
+# Built on top of exp36 TRIPLE (JEPA + AAMP + PARS).  Adds the
+# phase-aware Fourier loss (single FFT per patch, log-mag L2 +
+# (sin φ, cos φ) phase L2) at weight=0.01 — much lower than the
+# 0.1 used in exp30 which oscillated badly (val 0.29-0.90).
+#
+# This pairs with exp39 (triple + MR-STFT @ 0.05) to compare two
+# different spectral parameterizations on top of the triple base.
+#
+# Decision rule per pair: if either exp39 OR exp40 reaches
+# val_loss < exp36's step-5500 value (~0.16), spectral supervision
+# is additive; pick the cheaper / more stable one for the long run.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp40_quad_phase
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 48
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.99
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+    phase:
+      enabled: true
+      weight: 0.01            # 10x lower than exp30 (which oscillated at 0.1)
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp40_quad_phase
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp40_quad_phase_5500
+  wandb_tags:
+    - hbn
+    - mumbai_h100
+    - exp40
+    - smoke
+    - quad_aux
+    - jepa
+    - aamp
+    - pars
+    - phase
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp40_quad_phase
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_jepa_loss_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500

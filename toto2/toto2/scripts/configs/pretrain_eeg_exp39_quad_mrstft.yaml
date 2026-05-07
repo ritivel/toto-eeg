@@ -1,0 +1,151 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp39 QUAD: triple aux + MR-STFT spectral supervision.
+#
+# Built on top of exp36 TRIPLE (JEPA + AAMP + PARS) which is the
+# current best (val_loss=0.147 at step 12500/30000, projected
+# 0.13-0.14 final).  exp36 has zero spectral supervision; this exp
+# adds multi-resolution STFT loss (3 windows at fft=32/128/512) at
+# weight=0.05 (half of the standard 0.1 to avoid loss dilution).
+#
+# 5500-step smoke; the question is whether spectral supervision adds
+# anything on top of the proven triple.  Compared to exp36 at step
+# 5500 (val ~0.16), success criterion: val_loss < 0.155 at step 5500
+# AND no instability (train_loss decreasing monotonically through
+# step 1000).
+#
+# Pairs with exp40 (triple + PHASE @ 0.01) which tests the same
+# question with a different spectral parameterization.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp39_quad_mrstft
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 47
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 200
+  stable_steps: 5000
+  decay_steps: 300
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.99            # tighter EMA for short 5500-step horizon
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+    mrstft:
+      enabled: true
+      weight: 0.05             # half of standard 0.1 to avoid loss dilution
+      fft_sizes: [32, 128, 512]
+      hop_sizes: [8, 32, 128]
+
+trainer:
+  max_steps: 5500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp39_quad_mrstft
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp39_quad_mrstft_5500
+  wandb_tags:
+    - hbn
+    - mumbai_h100
+    - exp39
+    - smoke
+    - quad_aux
+    - jepa
+    - aamp
+    - pars
+    - mrstft
+    - mp_residual
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp39_quad_mrstft
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_jepa_loss_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: -1
+  save_last: true
+  every_n_train_steps: 500
