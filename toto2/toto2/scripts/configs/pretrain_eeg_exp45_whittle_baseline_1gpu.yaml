@@ -47,13 +47,8 @@ data:
 
   eeg:
     data_root: /home/tpavankalyan/eeg_data/parquet
-    train_glob: "sub-*/task-*.parquet"
-    val_glob: null
+    pipeline: hbn_minimal_500hz
     val_fraction: 0.05
-    sfreq: 500
-    expected_channels: 129
-    sliding_stride: 2048
-    min_observed_frac: 0.8
     concat_windows: 3
     transform:
       type: none
