@@ -50,8 +50,7 @@ data:
     pipeline: hbn_minimal_500hz
     val_fraction: 0.05
     concat_windows: 3
-    transform:
-      type: none
+    transform: none
 
 training:
   seed: 47
