@@ -169,7 +169,16 @@ _DEFAULT_MR_MPL = {
     "hop_sizes": (16, 64, 256),
     "win_sizes": None,           # None → defaults to fft_sizes
     "alpha_lm": 1.0,             # log-magnitude L1 weight (perceptual amp)
-    "beta_sc": 0.5,              # spectral convergence weight (raw amp shape)
+    "beta_sc": 0.0,              # spectral convergence weight.  Disabled by
+                                 # default after the GPU smoke discovered SC
+                                 # explodes to ~1e5 on real EEG with asinh-
+                                 # scaled targets (wide dynamic range
+                                 # ±13 dominates the Frobenius-norm form).
+                                 # Log-magnitude L1 + phase coherence already
+                                 # cover the "match the spectrum" objective
+                                 # (matches HiFi-WaveGAN's L_aux recipe);
+                                 # set to 0.5 only if you've explicitly
+                                 # checked SC's scale on your distribution.
     "gamma_pc": 1.0,             # magnitude-weighted phase coherence weight
     "pinball_calibration_weight": 0.05,  # small pinball term keeps the off-
                                          # median quantile knots calibrated;

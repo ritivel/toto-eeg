@@ -95,7 +95,7 @@ training:
     hop_sizes: [16, 64,  256]
     win_sizes: null
     alpha_lm: 1.0
-    beta_sc:  0.5
+    beta_sc:  0.0          # disabled (SC explodes on asinh EEG; see baseline yaml)
     gamma_pc: 1.0
     pinball_calibration_weight: 0.05
 

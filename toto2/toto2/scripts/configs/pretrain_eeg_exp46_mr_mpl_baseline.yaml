@@ -174,7 +174,16 @@ training:
     hop_sizes: [16, 64,  256]
     win_sizes: null                     # null → defaults to fft_sizes
     alpha_lm: 1.0                       # log-magnitude L1 (perceptual amp)
-    beta_sc:  0.5                       # spectral convergence (raw amp shape)
+    beta_sc:  0.0                       # spectral convergence DISABLED.
+                                        # On asinh-scaled EEG with wide
+                                        # dynamic range (±13 z-scores), SC
+                                        # explodes to 1e5+ and dominates the
+                                        # gradient → clipping wipes the
+                                        # update direction → NaN in 1-2
+                                        # steps (caught in the GPU smoke).
+                                        # Log-mag L1 already covers
+                                        # amplitude shape; matches HiFi-
+                                        # WaveGAN's L_aux recipe.
     gamma_pc: 1.0                       # ← THE phase coherence term
     pinball_calibration_weight: 0.05    # tiny pinball on side knots so
                                         # CRPS / coverage probes still work
