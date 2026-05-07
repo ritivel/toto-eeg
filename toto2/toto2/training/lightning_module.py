@@ -180,6 +180,18 @@ _DEFAULT_MR_MPL = {
                                  # set to 0.5 only if you've explicitly
                                  # checked SC's scale on your distribution.
     "gamma_pc": 1.0,             # magnitude-weighted phase coherence weight
+    "eps": 1e-4,                 # numerical guard for divisions / sqrts /
+                                 # logs.  Larger than the AMSE convention
+                                 # (1e-7) because the GPU smoke showed NaN
+                                 # gradients at low-amplitude bins where
+                                 # 1/(amp+eps) blew up.
+    "log1p_compress": True,      # use log1p(amp) instead of log(amp + eps)
+                                 # for the log-magnitude term.  log1p has
+                                 # gradient bounded by 1 everywhere, fixing
+                                 # the DDP NaN failure mode.
+    "nan_guard": True,           # defensive: torch.nan_to_num the final loss
+                                 # so a single bad bin on one rank can't
+                                 # corrupt every other rank via DDP all-reduce.
     "pinball_calibration_weight": 0.05,  # small pinball term keeps the off-
                                          # median quantile knots calibrated;
                                          # 0.0 = pure MR-MPL.  exp46 uses 0.05
@@ -485,6 +497,9 @@ class Toto2ForTraining(L.LightningModule):
                 alpha_lm=float(self.mr_mpl_cfg["alpha_lm"]),
                 beta_sc=float(self.mr_mpl_cfg["beta_sc"]),
                 gamma_pc=float(self.mr_mpl_cfg["gamma_pc"]),
+                eps=float(self.mr_mpl_cfg["eps"]),
+                log1p_compress=bool(self.mr_mpl_cfg["log1p_compress"]),
+                nan_guard=bool(self.mr_mpl_cfg["nan_guard"]),
             )
         else:
             self.mr_mpl_loss_fn = None

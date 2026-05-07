@@ -179,10 +179,12 @@ def mr_mpl_loss_1d(
     hop_sizes: Sequence[int] = (16, 64, 256),
     win_sizes: Optional[Sequence[int]] = None,
     alpha_lm: float = 1.0,
-    beta_sc: float = 0.5,
+    beta_sc: float = 0.0,
     gamma_pc: float = 1.0,
     patch_size: Optional[int] = None,
-    eps: float = 1e-7,
+    eps: float = 1e-4,
+    log1p_compress: bool = True,
+    nan_guard: bool = True,
     return_diagnostics: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
     """Multi-Resolution Magnitude-Phase Loss for 1-D / patched signals.
@@ -219,7 +221,33 @@ def mr_mpl_loss_1d(
         about the patch layout (it concatenates ``S * P`` into a single
         per-recording sequence before STFT).
     eps
-        Numerical guard for divisions / sqrts / logs.
+        Numerical guard for divisions / sqrts / logs.  Default ``1e-4``;
+        bumped from the AMSE convention of ``1e-7`` because the GPU smoke
+        showed NaN gradients under DDP when amp_x or amp_y underflowed
+        toward eps.  ``1e-4`` is well above any meaningful asinh-EEG
+        amplitude (in normalised z-score space the smallest non-trivial
+        amp is ~10⁻³ for a single very-low-energy STFT bin) so it does
+        not blunt the loss but does give the gradient through
+        ``log(amp + eps)`` and ``cos_diff = cross / (amp_x · amp_y)`` a
+        bounded-curvature regime to live in.
+    log1p_compress
+        If ``True`` (default), use ``torch.log1p(amp) = log(1 + amp)``
+        instead of ``torch.log(amp + eps)`` for the log-magnitude term.
+        ``log1p`` is monotone, equals 0 at ``amp = 0``, and has gradient
+        ``1 / (1 + amp)`` which is bounded by 1 — fixes the
+        ``1/(amp + eps)`` gradient blow-up at low-amplitude bins that
+        triggered NaN under DDP.  Set to ``False`` to recover the
+        plain-log form (matches some HiFi-GAN implementations).
+    nan_guard
+        If ``True`` (default), wrap the final loss in
+        ``torch.nan_to_num(loss, nan=0, posinf=1e3, neginf=-1e3)``.
+        This is a defensive backstop — if the upstream numerical
+        guards miss a single bad bin under DDP, this prevents the bad
+        rank's NaN from being all-reduced into every other rank's
+        gradient.  The masked value (``0``) is the per-recording
+        contribution from a fully-failed STFT scale; downstream
+        diagnostics (``mr_mpl_lm/sc/pc``) still preserve the raw
+        un-guarded values for debugging.
     return_diagnostics
         If ``True``, also return a dict of detached diagnostic tensors
         (per-scale L_lm / L_sc / L_pc, mean cos(θ_diff), amplitude ratio,
@@ -309,22 +337,37 @@ def mr_mpl_loss_1d(
         amp_y = (psd_y + eps_sq).sqrt()
 
         # ---- Term 1: log-magnitude L1 ----
-        # Per-element L1 between log-amplitudes; eps inside log keeps it bounded.
-        lm = (torch.log(amp_x + eps) - torch.log(amp_y + eps)).abs()  # (N, F, T)
+        # Per-element L1 between log-amplitudes.  Use log1p(amp) by default
+        # because log(amp + eps) has gradient 1/(amp + eps) which blows up
+        # to 1/eps when amp underflows toward 0 (caused NaN under DDP all-
+        # reduce in the GPU smoke).  log1p(amp) has gradient 1/(1+amp),
+        # bounded by 1 everywhere.  Also equals 0 at amp=0 (log of 1=0)
+        # which is the right "no signal here" value.
+        if log1p_compress:
+            lm = (torch.log1p(amp_x) - torch.log1p(amp_y)).abs()      # (N, F, T)
+        else:
+            lm = (torch.log(amp_x + eps) - torch.log(amp_y + eps)).abs()  # (N, F, T)
 
-        # ---- Term 2: spectral convergence ----
-        # Frame-wise relative L2 of the amplitude difference, then averaged
-        # across (frequency, time) and recordings.  Equivalent to
-        # ||A_x - A_y||_F / ||A_y||_F up to mean vs. sum over (F, T).
-        diff = amp_x - amp_y                                          # (N, F, T)
-        sc_num = diff.pow(2).sum(dim=(-2, -1)).sqrt()                 # (N,)
-        sc_den = amp_y.pow(2).sum(dim=(-2, -1)).sqrt().clamp_min(eps)
-        sc_per_rec = sc_num / sc_den                                   # (N,)
+        # ---- Term 2: spectral convergence (DISABLED by default) ----
+        # Frame-wise relative L2 of the amplitude difference.  In the GPU
+        # smoke, SC exploded to ~1e5 on asinh-scaled EEG (wide dynamic
+        # range, ±13 z-scores) and dominated the gradient.  Kept for
+        # completeness but ``beta_sc=0.0`` by default.
+        if beta_sc != 0.0:
+            diff = amp_x - amp_y                                          # (N, F, T)
+            sc_num = diff.pow(2).sum(dim=(-2, -1)).sqrt()                 # (N,)
+            sc_den = amp_y.pow(2).sum(dim=(-2, -1)).sqrt().clamp_min(eps)
+            sc_per_rec = sc_num / sc_den                                   # (N,)
+        else:
+            sc_per_rec = torch.zeros_like(lm.sum(dim=(-2, -1)))            # (N,) of zeros
 
         # ---- Term 3: magnitude-weighted phase coherence ----
         # cross_re = Re(X * conj(Y)) computed in real arithmetic (no .conj()).
         cross_re = spec_x.real * spec_y.real + spec_x.imag * spec_y.imag  # (N, F, T)
-        denom = (amp_x * amp_y).clamp_min(eps_sq)
+        # Use a *larger* denom-eps (configurable, default 1e-4) so the
+        # cos_diff gradient stays bounded even at low-energy bins where
+        # amp_x · amp_y is tiny.  This is the critical fix for the DDP NaN.
+        denom = (amp_x * amp_y).clamp_min(eps)
         cos_diff = (cross_re / denom).clamp(-1.0, 1.0)                 # (N, F, T)
         weight_pc = psd_y                                              # |Y|² weight
         # Aggregate per recording so the L_pc value is bounded in [0, 2]:
@@ -369,6 +412,15 @@ def mr_mpl_loss_1d(
 
     L = torch.stack(per_scale_losses).mean()
 
+    # Defensive nan_to_num finalizer.  This is a backstop — if any upstream
+    # numerical guard misses a single bad bin (e.g., a degenerate STFT
+    # output on one rank under DDP), this prevents the bad rank's NaN from
+    # being all-reduced into every other rank's gradient and corrupting
+    # the entire model in a single step.  In normal operation this is a
+    # no-op (the upstream guards keep everything finite).
+    if nan_guard:
+        L = torch.nan_to_num(L, nan=0.0, posinf=1e3, neginf=-1e3)
+
     if not return_diagnostics:
         return L
 
@@ -408,8 +460,11 @@ class MRMPLLoss(nn.Module):
         hop_sizes: Sequence[int] = (16, 64, 256),
         win_sizes: Optional[Sequence[int]] = None,
         alpha_lm: float = 1.0,
-        beta_sc: float = 0.5,
+        beta_sc: float = 0.0,
         gamma_pc: float = 1.0,
+        eps: float = 1e-4,
+        log1p_compress: bool = True,
+        nan_guard: bool = True,
     ) -> None:
         super().__init__()
         if win_sizes is None:
@@ -422,6 +477,9 @@ class MRMPLLoss(nn.Module):
         self.alpha_lm = float(alpha_lm)
         self.beta_sc = float(beta_sc)
         self.gamma_pc = float(gamma_pc)
+        self.eps = float(eps)
+        self.log1p_compress = bool(log1p_compress)
+        self.nan_guard = bool(nan_guard)
 
     def forward(
         self,
@@ -443,6 +501,9 @@ class MRMPLLoss(nn.Module):
             beta_sc=self.beta_sc,
             gamma_pc=self.gamma_pc,
             patch_size=patch_size,
+            eps=self.eps,
+            log1p_compress=self.log1p_compress,
+            nan_guard=self.nan_guard,
             return_diagnostics=return_diagnostics,
         )
 
@@ -450,5 +511,7 @@ class MRMPLLoss(nn.Module):
         return (
             f"fft_sizes={self.fft_sizes}, hop_sizes={self.hop_sizes}, "
             f"win_sizes={self.win_sizes}, "
-            f"alpha_lm={self.alpha_lm}, beta_sc={self.beta_sc}, gamma_pc={self.gamma_pc}"
+            f"alpha_lm={self.alpha_lm}, beta_sc={self.beta_sc}, gamma_pc={self.gamma_pc}, "
+            f"eps={self.eps}, log1p_compress={self.log1p_compress}, "
+            f"nan_guard={self.nan_guard}"
         )
