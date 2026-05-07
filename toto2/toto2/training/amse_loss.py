@@ -129,6 +129,7 @@ def amse_loss_1d(
     patch_size: Optional[int] = None,
     concat_patches: bool = True,
     spectral_weight_exponent: float = 0.0,
+    normalize_by_freq: bool = True,
     eps: float = 1e-8,
     return_diagnostics: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
@@ -160,8 +161,29 @@ def amse_loss_1d(
         Optional per-frequency weighting.  ``0.0`` (default) is uniform;
         ``2/3 ≈ 0.6667`` upweights high frequencies to compensate for
         EEG's roughly 1/f power spectrum.
+    normalize_by_freq
+        If ``True`` (default, **recommended**), divide the per-signal
+        AMSE by the number of frequency bins so the loss scale matches
+        per-element MSE rather than per-signal spectral energy.
+
+        **Why this matters.**  The raw AMSE = ``Σ_k [...]`` from the
+        paper has a magnitude proportional to the signal length ``N``
+        (Parseval: ``Σ_k |α_k|² = Σ_t |x_t|²``).  For HBN-EEG with
+        ``concat_patches=True`` and 4096-sample sequences, that puts
+        AMSE around 4000–10000 per signal — ~10⁴× larger than
+        pinball's ``~0.5`` per-element scale.  The Toto-2 trunk uses
+        ``base_lr=0.3`` which is tuned to pinball-scale gradients;
+        feeding the raw AMSE through it produces gradient norms that
+        explode (we observed ``grad_norm=inf`` and gradient clipping
+        wiping out the update direction so the model never moves).
+        Dividing by ``n_freq`` rescales AMSE to per-element-MSE units,
+        which puts it in the same order of magnitude as pinball and
+        keeps the existing u-μP-balanced LR transferable.
+
+        Set ``False`` only when comparing magnitude-faithfully to the
+        original GraphCast paper's loss values.
     eps
-        Numerical guard for the coherence ratio ``cross/(|X|·|Y|)``.
+        Numerical guard for divisions / sqrts in the spectral terms.
     return_diagnostics
         If ``True``, also return a dict of summary tensors (mean amplitude
         term, mean coherence term, mean coherence value, predicted/target
@@ -173,6 +195,17 @@ def amse_loss_1d(
         Scalar AMSE loss.
     dict, optional
         If ``return_diagnostics=True``, the diagnostic dict.
+
+    Notes
+    -----
+    *Numerical robustness.*  We compute the per-frequency ``PSD`` directly
+    from ``real² + imag²`` (rather than via ``|fft|.pow(2)``) so the
+    autograd path never goes through the ``|z|=0`` singularity of the
+    complex absolute value.  Amplitudes are pulled out of ``sqrt(PSD + eps²)``
+    so they are differentiable everywhere, and the coherence ratio
+    ``cross_re / (amp_x · amp_y)`` is clamped to ``[-1, 1]`` to absorb
+    fp32 round-off.  This fixes the ``grad_norm=inf`` pathology we
+    observed in the exp43 smoke run before this rewrite.
     """
     if pred.shape != target.shape:
         raise ValueError(
@@ -233,18 +266,25 @@ def amse_loss_1d(
     fft_gt = torch.fft.rfft(sig_gt, dim=-1, norm="ortho")
     n_freq = fft_pred.shape[-1]
 
-    # ----- per-frequency amplitudes / cross / PSD ---------------------
-    amp_x = fft_pred.abs()       # |α_x_k|
-    amp_y = fft_gt.abs()         # |α_y_k|
-    psd_x = amp_x * amp_x        # PSD_k(x)
-    psd_y = amp_y * amp_y        # PSD_k(y)
-    cross_re = (fft_pred * fft_gt.conj()).real
+    # ----- per-frequency PSD computed directly from real²+imag² --------
+    # Going through ``fft_pred.abs()`` would route gradients through the
+    # complex |z| singularity at z=0; computing PSD directly from the
+    # real and imaginary parts is well-defined everywhere.  We then
+    # extract amplitudes via ``sqrt(PSD + eps²)`` for the same reason.
+    psd_x = fft_pred.real.pow(2) + fft_pred.imag.pow(2)
+    psd_y = fft_gt.real.pow(2) + fft_gt.imag.pow(2)
+    eps_sq = float(eps) * float(eps)
+    amp_x = (psd_x + eps_sq).sqrt()
+    amp_y = (psd_y + eps_sq).sqrt()
+
+    # Cross term Re(α_x · α_y*).  Real-arithmetic formula avoids the
+    # complex-multiply path (more efficient and gradient-clean).
+    cross_re = fft_pred.real * fft_gt.real + fft_pred.imag * fft_gt.imag
 
     # Coherence Coh_k = Re(α_x α_y*) / (|α_x|·|α_y|).  Bound to [-1, 1]
     # to absorb numerical noise — the analytic value is always in this
     # range for real signals but rounding can produce slight overshoot.
-    denom = (amp_x * amp_y).clamp_min(eps)
-    coh = (cross_re / denom).clamp(-1.0, 1.0)
+    coh = (cross_re / (amp_x * amp_y)).clamp(-1.0, 1.0)
 
     # ----- AMSE per frequency ------------------------------------------
     amp_term = (amp_x - amp_y).pow(2)                            # (√PSD_x − √PSD_y)²
@@ -262,7 +302,17 @@ def amse_loss_1d(
         coh_term = coh_term * w
 
     per_freq = amp_term + coh_term            # (..., n_freq)
-    per_signal = per_freq.sum(dim=-1)         # sum_k → per-signal AMSE
+    if normalize_by_freq:
+        # MEAN over freq → per-frequency average (≈ MSE per element by
+        # Parseval).  This is what makes the loss scale comparable to
+        # pinball / MSE so a u-μP-balanced LR transfers without
+        # gradient-clip blow-up.
+        per_signal = per_freq.mean(dim=-1)
+    else:
+        # SUM over freq → per-signal total spectral error (paper §2.3
+        # convention).  Matches the magnitude of MSE * N where N is the
+        # signal length.
+        per_signal = per_freq.sum(dim=-1)
 
     # ----- per-signal validity reduction ------------------------------
     # When concat_patches=True: per_signal has shape (..., ); we drop
@@ -316,6 +366,11 @@ class AMSELoss(nn.Module):
         See :func:`amse_loss_1d`.  ``True`` by default (recommended for EEG).
     spectral_weight_exponent
         See :func:`amse_loss_1d`.  ``0.0`` by default (uniform weighting).
+    normalize_by_freq
+        See :func:`amse_loss_1d`.  ``True`` by default (per-element-MSE
+        scale, comparable to pinball — required for the existing
+        u-μP-balanced ``base_lr=0.3`` to work without gradient clipping
+        wiping out the update signal).
     """
 
     def __init__(
@@ -323,10 +378,12 @@ class AMSELoss(nn.Module):
         *,
         concat_patches: bool = True,
         spectral_weight_exponent: float = 0.0,
+        normalize_by_freq: bool = True,
     ) -> None:
         super().__init__()
         self.concat_patches = bool(concat_patches)
         self.spectral_weight_exponent = float(spectral_weight_exponent)
+        self.normalize_by_freq = bool(normalize_by_freq)
 
     def forward(
         self,
@@ -344,11 +401,13 @@ class AMSELoss(nn.Module):
             patch_size=patch_size,
             concat_patches=self.concat_patches,
             spectral_weight_exponent=self.spectral_weight_exponent,
+            normalize_by_freq=self.normalize_by_freq,
             return_diagnostics=return_diagnostics,
         )
 
     def extra_repr(self) -> str:
         return (
             f"concat_patches={self.concat_patches}, "
-            f"spectral_weight_exponent={self.spectral_weight_exponent}"
+            f"spectral_weight_exponent={self.spectral_weight_exponent}, "
+            f"normalize_by_freq={self.normalize_by_freq}"
         )

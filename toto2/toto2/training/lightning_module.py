@@ -77,6 +77,14 @@ LossType = Literal["pinball", "amse"]
 _DEFAULT_AMSE = {
     "concat_patches": True,           # FFT over the full S·P sequence
     "spectral_weight_exponent": 0.0,  # 0 = uniform; 2/3 = EEG 1/f comp.
+    "normalize_by_freq": True,        # MEAN over freq bins → per-element
+                                      # MSE scale, comparable to pinball.
+                                      # See ``amse_loss_1d`` for the full
+                                      # rationale; required to keep the
+                                      # u-μP-balanced base_lr=0.3
+                                      # transferable from the pinball
+                                      # baselines without gradient clipping
+                                      # wiping out the update direction.
     "pinball_calibration_weight": 0.0,  # optional small pinball term to
                                         # keep the off-median knots
                                         # calibrated; 0 = pure AMSE
@@ -312,6 +320,7 @@ class Toto2ForTraining(L.LightningModule):
             self.amse_loss_fn = AMSELoss(
                 concat_patches=bool(self.amse_cfg["concat_patches"]),
                 spectral_weight_exponent=float(self.amse_cfg["spectral_weight_exponent"]),
+                normalize_by_freq=bool(self.amse_cfg["normalize_by_freq"]),
             )
         else:
             self.amse_loss_fn = None

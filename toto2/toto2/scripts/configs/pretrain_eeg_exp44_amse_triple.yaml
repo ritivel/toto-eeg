@@ -103,6 +103,7 @@ training:
   amse:
     concat_patches: true
     spectral_weight_exponent: 0.0
+    normalize_by_freq: true
     pinball_calibration_weight: 0.0
 
   # ---------- exp36 triple auxiliary supervision (unchanged) ----------

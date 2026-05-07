@@ -105,7 +105,11 @@ def test_amse_zero_at_perfect_prediction_per_patch():
 
 
 def test_amse_close_to_mse_near_optimum():
-    """AMSE matches MSE near the optimum — same Taylor expansion (paper §2.3)."""
+    """AMSE matches MSE near the optimum — same Taylor expansion (paper §2.3).
+
+    With ``normalize_by_freq=True`` (default), AMSE is per-element-MSE
+    scale, so we compare against the spectral MSE divided by ``n_freq``.
+    """
     torch.manual_seed(0)
     target = torch.randn(2, 3, 4, 16)
     # Tiny perturbation: pred ≈ target + 0.01*ε.  AMSE / MSE ratio should
@@ -113,15 +117,52 @@ def test_amse_close_to_mse_near_optimum():
     # to second order around the optimum).
     pred = target + 0.01 * torch.randn_like(target)
     amse = amse_loss_1d(pred, target, concat_patches=True)
-    # Reference MSE in the spectral sense (Σ_k |α_x − α_y|², orthonormal FFT).
+    # Reference MSE in the spectral sense (Σ_k |α_x − α_y|², orthonormal FFT),
+    # divided by n_freq to match the per-element scale of normalize_by_freq.
     fft_pred = torch.fft.rfft(pred.flatten(start_dim=2), dim=-1, norm="ortho")
     fft_gt = torch.fft.rfft(target.flatten(start_dim=2), dim=-1, norm="ortho")
-    spectral_mse = (fft_pred - fft_gt).abs().pow(2).sum(dim=-1).mean()
+    n_freq = fft_pred.shape[-1]
+    spectral_mse_per_freq = (
+        (fft_pred - fft_gt).abs().pow(2).sum(dim=-1).mean() / n_freq
+    )
     # 5% slack — they are exactly equal in the Taylor limit but with finite
     # perturbation there is a tiny difference from the max-vs-geom-mean
     # cross-term split.
-    rel_err = ((amse - spectral_mse).abs() / spectral_mse.clamp_min(1e-9)).item()
-    assert rel_err < 0.05, f"AMSE/MSE near optimum should match: {amse.item():.3e} vs {spectral_mse.item():.3e}"
+    rel_err = ((amse - spectral_mse_per_freq).abs() / spectral_mse_per_freq.clamp_min(1e-9)).item()
+    assert rel_err < 0.05, (
+        f"AMSE/MSE_per_freq near optimum should match: {amse.item():.3e} "
+        f"vs {spectral_mse_per_freq.item():.3e}"
+    )
+
+
+def test_amse_normalize_by_freq_ratio():
+    """``normalize_by_freq=False`` should give exactly ``n_freq`` × the
+    normalized AMSE.  Verifies the only difference between the two
+    modes is the per-frequency averaging."""
+    torch.manual_seed(0)
+    pred = torch.randn(2, 3, 4, 32)
+    target = torch.randn(2, 3, 4, 32)
+    n_freq = (32 * 4) // 2 + 1  # rfft over concatenated 128-sample sequence
+
+    loss_normalized = amse_loss_1d(pred, target, concat_patches=True, normalize_by_freq=True)
+    loss_unnormalized = amse_loss_1d(pred, target, concat_patches=True, normalize_by_freq=False)
+    ratio = (loss_unnormalized / loss_normalized).item()
+    assert abs(ratio - n_freq) < 1.0, f"ratio {ratio} != n_freq {n_freq}"
+
+
+def test_amse_finite_gradient_at_zero_prediction():
+    """Pre-fix AMSE produced inf gradients when the prediction was all zeros
+    (the |z|=0 singularity of the complex absolute value).  The rewrite
+    computes PSD directly from real²+imag² with ``sqrt(PSD + eps²)`` so
+    gradients are finite everywhere.  Regression test for the smoke-run
+    post-mortem."""
+    torch.manual_seed(0)
+    pred = torch.zeros(2, 3, 4, 16, requires_grad=True)
+    target = torch.randn(2, 3, 4, 16)
+    loss = amse_loss_1d(pred, target, concat_patches=True)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(pred.grad).all(), "AMSE gradient must be finite at pred=0"
 
 
 def test_amse_amplitude_only_error_uses_only_amp_term():

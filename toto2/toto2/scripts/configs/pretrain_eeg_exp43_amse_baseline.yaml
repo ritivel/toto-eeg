@@ -156,6 +156,18 @@ training:
                                         # 0.667 = (1+omega)^(2/3) EEG 1/f
                                         # bias correction; not enabled in
                                         # this principled control run.
+    normalize_by_freq: true             # MEAN over freq bins so AMSE has
+                                        # per-element-MSE scale (~0.5 for
+                                        # unit-variance error) rather than
+                                        # per-signal spectral energy
+                                        # (~10000 for 4096-sample signals).
+                                        # Required for the u-μP-balanced
+                                        # base_lr=0.3 to transfer from the
+                                        # pinball baselines without
+                                        # gradient clipping wiping out the
+                                        # update direction.  See the smoke
+                                        # post-mortem in amse_loss.py for
+                                        # the full numerical rationale.
     pinball_calibration_weight: 0.0     # pure AMSE; no pinball calibration
                                         # term on the side knots.  exp43
                                         # tests AMSE in isolation; if the
