@@ -71,9 +71,14 @@ def main():
 
     peft_modules = None
     if any(s in args.strategies for s in ["lora", "ia3", "adalora", "dora", "oft"]):
-        peft_modules = [
-            "_toto.transformer.layers",
-        ]
+        # Target the attention + FFN linear layers in every transformer block.
+        # PEFT does suffix matching, so these names match across all
+        # ``_toto.transformer.layers.{i}.attn.in_proj``,
+        # ``_toto.transformer.layers.{i}.attn.out_proj``,
+        # ``_toto.transformer.layers.{i}.ffn.fc1``,
+        # ``_toto.transformer.layers.{i}.ffn.fc2``.
+        # uu.Linear is a subclass of nn.Linear so PEFT accepts it.
+        peft_modules = ["in_proj", "out_proj", "fc1", "fc2"]
 
     model_kwargs = dict(
         d_model=args.d_model,
