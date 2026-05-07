@@ -1,0 +1,202 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp48 MR-MPL LONG: pure MR-MPL trained 11x as long as exp46.
+#
+# Tests whether the exp46 breakthrough keeps improving with more steps
+# or plateaus.  At step 5187 (last val) of the completed exp46 run the
+# trajectory was still cleanly decreasing -- val_pinball ended at 0.184
+# (just below Probe F's 0.184 baseline) and val_trunk_eff_rank_ratio
+# was still climbing (0.005 -> 0.014 -> 0.036 -> 0.052 -> 0.067 ->
+# 0.077).  Neither metric had plateaued, so we don't know how good
+# pure MR-MPL can get -- exp46 was a 75-min sprint to make a binary
+# decision (does the loss work at all), not a complete training run.
+#
+# 60000 steps lets us:
+#   * Match and exceed exp33 (JEPA only at 35000 steps, val_loss=0.175)
+#     and exp34 (JEPA+AAMP at 30000 steps, val_loss=0.1675) on a longer
+#     compute budget.
+#   * Test if MR-MPL alone can match exp36's triple-aux 0.1384 ceiling
+#     just with more data (per the "loss landscape > auxiliaries"
+#     hypothesis if MR-MPL really did fix the trunk).
+#   * See where val_trunk_eff_rank_ratio actually plateaus (still
+#     climbing at step 5187 = 0.077).
+#
+# WHAT CHANGES vs. exp46 (MR-MPL baseline)
+# ----------------------------------------
+# 1. max_steps 5500 -> 60000  (~11x more compute)
+# 2. WSD schedule stretched proportionally:
+#       warmup_steps:   200  -> 1000
+#       stable_steps:  5000  -> 56000
+#       decay_steps:    300  -> 3000
+# 3. Checkpoint cadence reduced to every 2500 steps to keep disk usage
+#    sane (would otherwise produce 120 checkpoints).
+# 4. seed 48 -> 50 (different roll for cleaner ablation if exp46
+#    happened to land on a lucky seed).
+# 5. devices: GPUs 4-7 (set via launcher's CUDA_VISIBLE_DEVICES).
+#
+# WHAT STAYS THE SAME
+# -------------------
+# Everything else is byte-identical to exp46:
+# * MR-MPL config (alpha_lm=1.0, beta_sc=0.0, gamma_pc=1.0,
+#   pinball_calibration_weight=0.05, fft_sizes=[64,256,1024]).
+# * Architecture (24M, mp_residual, qk_norm, d_model=384x12).
+# * Data (HBN-EEG, 250k 4096-sample windows @ 500Hz, 129 channels).
+# * Optimizer (AdamW, base_lr=0.3, wd=0).
+# * Precision (32-true), gradient_clip_val=1.0.
+# * Batch size 16 (no auxiliaries, no JEPA EMA copy memory).
+#
+# DECISION RULE (after 60000 steps + ridge probe on TUAB)
+# -------------------------------------------------------
+# Decision A (pure MR-MPL is enough; auxiliaries optional):
+#   * val_pinball <= 0.16 (vs Probe F's 0.184; vs exp46's 0.183)
+#   * val_mr_mpl_cos_mean_mean >= 0.96
+#   * val_trunk_eff_rank_ratio > 0.2
+#   * TUAB ridge AUROC >= Probe F + 0.02
+#   ⇒ MR-MPL is THE recipe.  Skip auxiliaries entirely for the v4
+#      production model.  Compare side-by-side with exp47 (triple).
+#
+# Decision B (pure MR-MPL plateaus around exp46's level):
+#   * val_pinball stalls at 0.17-0.19 from step 5500 to 60000
+#   ⇒ MR-MPL alone has a fundamental ceiling; auxiliaries (exp47)
+#     are needed to break through.  Use exp47's recipe instead.
+#
+# Decision C (instability later in training):
+#   * Loss spike or NaN after step 20000
+#   ⇒ Long-run instability of MR-MPL on EEG (unexpected; investigate
+#     whether log1p(amp) gradient saturates as model improves and
+#     produces extremely bright spectrum bins).
+#
+# RESOURCE BUDGET
+# ---------------
+# 60000 steps on 4xH100 SXM5 80GB at precision: 32-true, batch 16
+# (no aux) = ~9.4 hours wall-clock at ~107 step/min (1.78 it/s).
+# Runs concurrently with exp47 on GPUs 0-3 to fully utilise the box
+# overnight; both finish in roughly the same wall-clock window.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp48_mr_mpl_long
+
+# --------------------------------------------------------------------
+# Model — IDENTICAL to exp46 (mp_residual baseline)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+# --------------------------------------------------------------------
+# Data — IDENTICAL to exp46 (HBN-EEG, no outer transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp46 recipe but stretched 5x
+# --------------------------------------------------------------------
+training:
+  seed: 50                              # different from exp46 (48) and exp47 (49)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 56000
+  decay_steps: 3000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                     # only used by pinball calib term
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 60000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 2000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp48_mr_mpl_long
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp48_mr_mpl_long_60k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp48
+    - mr_mpl
+    - probe_f_baseline
+    - mp_residual
+    - no_aux
+    - long_run
+    - scaling_test
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp48_mr_mpl_long
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500

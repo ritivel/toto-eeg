@@ -1,0 +1,165 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp47 SMOKE: MR-MPL + TRIPLE AUX preflight check (~12 min).
+#
+# This is the single highest-risk part of the overnight plan because
+# MR-MPL has never been combined with AAMP (which masks 20-40% of input
+# patches).  The hypothesis is that MR-MPL's STFT windows of 64/256/1024
+# samples (1/4/16 patches) localise the AAMP-mask contamination far
+# better than AMSE's whole-sequence FFT did in the killed exp44, but
+# this needs verification before committing 5 GPU-hours to the full run.
+#
+# SUCCESS CRITERIA (gate to launching exp47 full)
+# -----------------------------------------------
+# A. train_mr_mpl + val_mr_mpl monotonically decreasing through 1000 steps.
+# B. train_mr_mpl_cos_mean_mean grows past 0.5 within 1000 steps
+#    (vs exp46's 0.236 -> 0.901 in the same window).
+# C. JEPA, AAMP, PARS auxiliary losses all decreasing.
+# D. amp_ratio_mean in [0.3, 2.0]; no spectrum collapse.
+# E. grad_norm finite, in [1e-4, 1e2].
+# F. NO NaN / Inf in any logged value -- the kill switch.
+# G. Wall-clock < 18 min on 4xH100 SXM5 80GB.
+#
+# IF (A) - (G) all pass -> launch exp47 full (15000 steps, ~5h).
+# IF any fails:
+#   * NaN/Inf -> drop the 1024-sample STFT window, retry smoke.
+#   * cos_mean stalls -> AAMP is interfering with phase signal; lower
+#     mask_ratio_range to [0.10, 0.20], retry.
+#   * AAMP loss diverges -> pure MR-MPL (exp48) is still running; let
+#     it cover the night and skip exp47.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp47_mr_mpl_triple_smoke
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+data:
+  context_length: 4096
+  train_batch_size: 12
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 49
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 100
+  stable_steps: 800
+  decay_steps: 100
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+
+trainer:
+  max_steps: 1000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  val_check_interval: 250
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 25
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp47_mr_mpl_triple_smoke
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp47_mr_mpl_triple_smoke_1000steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp47
+    - mr_mpl
+    - triple_aux
+    - smoke
+    - preflight
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp47_mr_mpl_triple_smoke
+  filename: "{epoch}-{step}-{val_loss:.4f}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 1
+  save_last: true
+  every_n_train_steps: 500

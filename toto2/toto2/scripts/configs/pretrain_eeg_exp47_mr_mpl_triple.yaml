@@ -1,0 +1,220 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp47 MR-MPL on the TRIPLE (JEPA + AAMP + PARS) recipe.
+#
+# Tests whether the exp46 breakthrough composes with the auxiliary
+# losses that took exp36 to val_loss = 0.1384 (the previous production
+# baseline).  Direct analog of the planned-but-killed exp44 (AMSE +
+# triple), which was abandoned because AMSE's whole-sequence FFT
+# combined badly with AAMP-masked patches.  MR-MPL uses STFT windows
+# of 64 / 256 / 1024 samples (1 / 4 / 16 patches), so the "AAMP-mask
+# bleed across the whole spectrum" failure mode that killed exp44 is
+# expected to be much milder here -- the largest window only sees up
+# to 6 AAMP-masked patches out of 16, leaving 10+ true-signal patches
+# to anchor the spectral / phase estimate.
+#
+# WHAT CHANGES vs. exp46 (MR-MPL alone, val_pinball=0.183 at 5500 steps)
+# ----------------------------------------------------------------------
+# 1. Add the exp36 triple auxiliary supervision (JEPA + AAMP + PARS at
+#    exp36 weights, identical config).
+# 2. Match exp36 batch size (12 instead of 16) for GPU memory headroom
+#    with JEPA EMA + 3 aux heads.
+# 3. Match exp36 strategy (`ddp_find_unused_parameters_true`) so the
+#    JEPA EMA copy doesn't trigger DDP errors on unused params.
+# 4. Match exp36's 30000-step WSD schedule (warmup 1000 / stable 27000
+#    / decay 2000) so the comparison vs exp36 (val_loss=0.1384) is
+#    head-to-head identical except for the supervision swap
+#    pinball -> MR-MPL.
+#
+# WHAT STAYS THE SAME
+# -------------------
+# * MR-MPL loss + sub-loss weights (alpha_lm=1.0, beta_sc=0.0,
+#   gamma_pc=1.0) -- identical to exp46.
+# * pinball_calibration_weight=0.05 so the off-median knots get
+#   per-position supervision (head usable for downstream).
+# * Architecture (24M, mp_residual, qk_norm, d_model=384x12).
+# * Data (HBN-EEG, 250k 4096-sample windows @ 500Hz, 129 channels).
+# * Optimizer (AdamW, base_lr=0.3, wd=0).
+# * Precision (32-true) and gradient_clip_val=1.0.
+# * STFT scales (64/256/1024 with hops 16/64/256) -- KEPT the 1024
+#   window for delta/theta resolution; AAMP bleed is bounded.
+#
+# DECISION RULE (after 30000 steps + ridge probe on TUAB)
+# -------------------------------------------------------
+# Decision A (composability win, NEW production recipe):
+#   * val_pinball <= exp46's 0.18 - 0.01 = 0.17
+#     OR val_loss <= exp36's 0.14 - 0.005 = 0.135
+#   * val_mr_mpl_cos_mean_mean >= 0.9  (don't lose the phase win)
+#   * val_mr_mpl_amp_ratio_mean in [0.7, 1.3]
+#   * val_trunk_eff_rank_ratio > exp46's 0.07
+#   * No NaN / Inf in any logged value
+#   ⇒ Promote to new production baseline; rerun TUAB downstream eval.
+#     Becomes the recipe for any larger-scale Toto2-EEG release.
+#
+# Decision B (auxiliaries hurt MR-MPL):
+#   * val_pinball > 0.20 OR val_mr_mpl_cos_mean_mean < 0.8
+#   ⇒ The auxiliaries compete with MR-MPL for FFN capacity.  Drop the
+#     weakest aux (likely PARS, which only matched baseline alone in
+#     exp29) and rerun.  Fallback: pure MR-MPL (exp46) is still the
+#     baseline.
+#
+# Decision C (instability):
+#   * NaN / Inf early, or grad_norm > 100
+#   ⇒ AAMP-mask spectral bleed is real; try dropping the 1024-sample
+#     STFT window (keep only 64 + 256) and rerun.
+#
+# RESOURCE BUDGET
+# ---------------
+# 30000 steps on 4xH100 SXM5 80GB at precision: 32-true, batch 12,
+# triple aux + MR-MPL = ~10 hours wall-clock (matches exp36 exactly).
+# Runs concurrently with exp48 on GPUs 4-7 to fully utilise the box.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp47_mr_mpl_triple
+
+# --------------------------------------------------------------------
+# Model — same as exp36 / exp46 (mp_residual baseline)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+
+# --------------------------------------------------------------------
+# Data — same as exp36 (smaller batch for triple-aux memory)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 12                  # exp36's smaller batch (aux memory)
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp36 schedule + exp46 MR-MPL primary loss + exp36 aux
+# --------------------------------------------------------------------
+training:
+  seed: 49                              # different from exp36 (45) and exp46 (48)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 27000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                     # only used by pinball calib term
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  # ---------- exp46 MR-MPL supervision (primary loss, unchanged) ----------
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0                       # log-magnitude L1
+    beta_sc:  0.0                       # disabled (explodes on asinh EEG)
+    gamma_pc: 1.0                       # phase coherence
+    pinball_calibration_weight: 0.05    # tiny pinball on side knots
+
+  # ---------- exp36 triple auxiliary supervision (unchanged) ----------
+  auxiliary:
+    jepa:
+      enabled: true
+      weight: 0.1
+      sigreg_weight: 0.01
+      proj_dim: 256
+      ema_tau: 0.999
+      sigreg_num_slices: 256
+      sigreg_n_quad_points: 17
+    aamp:
+      enabled: true
+      mask_ratio_range: [0.20, 0.40]
+    pars:
+      enabled: true
+      weight: 0.1
+      num_pairs: 12
+      head_dim: 64
+      mlp_hidden: 512
+
+trainer:
+  max_steps: 30000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_true   # JEPA EMA copy
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp47_mr_mpl_triple
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp47_mr_mpl_triple_30k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp47
+    - mr_mpl
+    - triple_aux
+    - jepa
+    - aamp
+    - pars
+    - mp_residual
+    - composability_test
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp47_mr_mpl_triple
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 2500
