@@ -57,7 +57,12 @@ model:
   mp_residual_alpha: 1.0
   use_reference_gauge: true
   reference_gauge_method: car
-  gauge_augment_std: 5.0           # ON for the smoke — stress-tests the projection
+  gauge_augment_std: 0.0           # off — matches the full run exactly.
+                                   # NOTE: a 2026-05-08 trial with std=5.0 surfaced a
+                                   # bug in the lightning loss path (gt_next is not
+                                   # co-projected, so the random offset breaks the
+                                   # supervision rather than testing CAR).  Tracked
+                                   # for exp50b+; current smoke tests CAR-only.
 
 data:
   context_length: 4096
