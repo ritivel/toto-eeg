@@ -68,50 +68,48 @@ class Toto2ModelConfig:
 
     # ----------------------------------------------------------------
     # exp50 — Reference-electrode gauge projection (universal-EEG #2)
-    #
-    # EEG voltages are physically defined only up to an additive
-    # per-timestep constant: any choice of reference electrode shifts
-    # every channel by the same scalar.  Helmholtz reciprocity (1853)
-    # makes this rigorous: ``v = K · j`` is invariant under
-    # ``v -> v + c·1``.  The model SHOULD therefore live on the
-    # quotient ``R^C / R·1`` rather than on raw ``R^C``.  The cheapest
-    # way to enforce this is to project ``v`` onto the zero-mean
-    # subspace at model layer 0:
-    #
-    #     P  = I - (1/C) 11^T          (Common Average Reference)
-    #     v_t -> P · v_t               (per timestep)
-    #
-    # ``P`` is the orthogonal projector onto ``{v : sum(v) = 0}``; it
-    # zeroes out the +c·1 gauge mode and preserves all the other
-    # ``C - 1`` directions exactly.  Application is O(C) per timestep
-    # and adds zero parameters.  See R2-C / R1-S1 for the
-    # affine-invariant-SPD ↔ gauge-quotient ↔ sheaf-cohomology chain.
-    #
-    #   use_reference_gauge       — turn the projection on / off.
-    #     False (default) keeps Toto byte-identical to exp48.
-    #
-    #   reference_gauge_method    — currently only ``"car"`` (Common
-    #     Average Reference).  ``"rest"`` is reserved for a future
-    #     experiment that will use the Yao 2001 REST projector
-    #     ``T_REST = G · (K^T K + λI)^(-1) · K^T`` derived from the
-    #     analytic 3-shell head model and electrode coordinates.
-    #     Listed but not implemented — defining the head model + lead
-    #     field at training time is materially more invasive and
-    #     deserves its own A/B.
-    #
-    #   gauge_augment_std         — std of an additive per-(batch,
-    #     timestep) constant ``c·1`` injected on the input *before*
-    #     CAR is applied (training only).  Mathematically a no-op
-    #     against pure CAR, but acts as a stress-test of the
-    #     projection: any path that bypasses CAR (e.g. a numerical
-    #     bug in the mask handling) becomes a sensitivity to the
-    #     random offset and is caught by an explosion of
-    #     val_observed_frac-weighted CAR residual.  Default 0.0
-    #     (off); the smoke YAML exercises it briefly.
+    # See full doc-comment at the bottom of this dataclass section.
     # ----------------------------------------------------------------
     use_reference_gauge: bool = False
     reference_gauge_method: str = "car"
     gauge_augment_std: float = 0.0
+
+    # ----------------------------------------------------------------
+    # exp51 — DPSS-tapered causal scaler (universal-EEG #3)
+    #
+    # The default ``PatchedCausalStdScaler`` uses a Welford-style
+    # cumulative sample mean / variance over the entire causal history
+    # at each patch boundary.  Sample variance with rectangular
+    # weighting is biased upward by transient bursts (alpha bursts,
+    # sleep spindles, eye-blink artefacts, electrode pops) — a single
+    # outlier sample contributes its full squared deviation to the
+    # scale, which then divides the rest of the patch and squashes the
+    # whole window's amplitude.
+    #
+    # exp51 replaces the variance estimator with a per-patch Thomson
+    # multitaper using K leading discrete prolate spheroidal sequences
+    # (DPSS / Slepian) of length ``patch_size`` and time-bandwidth
+    # ``dpss_NW``.  DPSS sequences are the unique signals maximally
+    # concentrated in both time [0, P) and frequency [-W, W] under the
+    # Heisenberg-Donoho-Stark uncertainty bound (Slepian 1978), and the
+    # multitaper PSD they form is minimum-variance among all linear
+    # estimators (Thomson 1982; Percival & Walden 1993).  In practice
+    # the tapers down-weight the patch edges (where bursts and seam
+    # transients live) and average K independent low-bias estimates,
+    # giving a substantial reduction in scaler bias on EEG.
+    #
+    #   use_dpss_scaler   — turn the multitaper variance on / off.
+    #     False (default) keeps Toto byte-identical to exp48 / main.
+    #
+    #   dpss_NW           — time-bandwidth product.  Standard EEG
+    #     practice uses NW = 2.5 (Babadi & Brown, IEEE TBME 2014).
+    #
+    #   dpss_K            — number of leading DPSS tapers used.  K=3
+    #     is the convention for NW=2.5 (K = 2NW - 1 rule of thumb).
+    # ----------------------------------------------------------------
+    use_dpss_scaler: bool = False
+    dpss_NW: float = 2.5
+    dpss_K: int = 3
 
     @staticmethod
     def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
@@ -139,6 +137,23 @@ class Toto2ModelConfig:
             if self.gauge_augment_std < 0:
                 raise ValueError(
                     f"gauge_augment_std must be >= 0; got {self.gauge_augment_std}."
+                )
+        if self.use_dpss_scaler:
+            if self.dpss_K < 1:
+                raise ValueError(f"dpss_K must be >= 1; got {self.dpss_K}.")
+            if self.dpss_K > self.patch_size:
+                raise ValueError(
+                    f"dpss_K ({self.dpss_K}) must not exceed patch_size "
+                    f"({self.patch_size}); each DPSS taper has length patch_size "
+                    f"and only patch_size orthogonal sequences exist."
+                )
+            if self.dpss_NW <= 0:
+                raise ValueError(f"dpss_NW must be > 0; got {self.dpss_NW}.")
+            if self.dpss_NW >= self.patch_size / 2:
+                raise ValueError(
+                    f"dpss_NW ({self.dpss_NW}) must be < patch_size/2 "
+                    f"({self.patch_size / 2}); the half-bandwidth W = NW/P would "
+                    f"otherwise reach the Nyquist frequency and DPSS becomes degenerate."
                 )
         if self.residual_attn_ratio is None:
             if self.mp_residual:

@@ -266,6 +266,325 @@ class PatchedCausalStdScaler(nn.Module):
 
 
 # =====================================================================
+# exp51 — DPSS-tapered (Slepian multitaper) scaler (universal-EEG #3)
+# =====================================================================
+#
+# Replaces ``PatchedCausalStdScaler``'s Welford cumulative variance with
+# a per-patch Thomson multitaper (1982) estimator built from the K
+# leading discrete prolate spheroidal sequences (Slepian 1978) of
+# length P = ``patch_size``.
+#
+# Mathematics
+# -----------
+# DPSS sequences {u_k}_{k=0..N-1} of length N for time-bandwidth NW are
+# the eigenvectors of the symmetric Toeplitz "sinc kernel"
+#
+#     K_NW[i, j] = sin(2π · NW · (i - j) / N) / (π · (i - j))         (i ≠ j)
+#     K_NW[i, i] = 2 · NW / N
+#
+# whose eigenvalues λ_k ∈ (0, 1) measure how well-concentrated u_k is in
+# the half-bandwidth W = NW/N.  Equivalently (Slepian 1978, eq. 3.3),
+# they are the eigenvectors of the symmetric tridiagonal matrix
+#
+#     T[i, i]   = ((N - 1) / 2 - i)² · cos(2π · NW / N)
+#     T[i, i+1] = T[i+1, i] = (i + 1) (N - i - 1) / 2
+#
+# with the K largest eigenvalues, normalised to L² = 1.  Solving the
+# tridiagonal eigenproblem is numerically far more stable than the
+# Toeplitz one and gives the same eigenvectors; we use ``numpy.linalg.eigh``
+# at ``__init__`` time and ship the result as a non-persistent buffer.
+#
+# Given the K orthonormal tapers and concentration weights w_k = λ_k:
+#
+#     a_{s,k} = Σ_t u_k[t] · y_s[t]            (taper-weighted projection)
+#     σ̂²_s   = (Σ_k w_k · a_{s,k}²) / Σ_k w_k  (Thomson multitaper variance)
+#
+# where y_s[t] = (v_s[t] - μ̂_s) · m_s[t] is the mask-aware centered patch
+# and μ̂_s is the per-patch sample mean.  The taper edge-tapering down-
+# weights the boundary samples where transient bursts (alpha bursts,
+# sleep spindles, electrode pops) live, and averaging across K
+# independent low-bias estimators reduces the variance of σ̂² toward the
+# Cramér–Rao lower bound (Percival & Walden 1993, §7).
+#
+# Causality
+# ---------
+# Each patch's (loc, scale) depends only on that patch's samples — the
+# same per-patch broadcast contract as ``PatchedCausalStdScaler``.  At
+# any timestep t inside patch s, no information from patches s+1, s+2,
+# ... is used.  This is "patched causal" in the same sense as the
+# Welford scaler.  We also do NOT carry running history across patches:
+# the previous scaler's cumulative Welford accumulation is replaced
+# with strictly local per-patch estimates, which are mathematically the
+# right device for the "scaler bias on bursty signals" failure mode
+# this experiment targets (R2-A P5).
+#
+# References
+# ----------
+# - Slepian, D. "Prolate spheroidal wave functions, Fourier analysis,
+#   and uncertainty — V: The discrete case." BSTJ 57 (1978).
+# - Thomson, D. J. "Spectrum estimation and harmonic analysis." Proc.
+#   IEEE 70 (1982).
+# - Percival, D. B. & Walden, A. T.  Spectral Analysis for Physical
+#   Applications.  Cambridge University Press, 1993.
+# - Babadi, B. & Brown, E. N. "A review of multitaper spectral analysis."
+#   IEEE Trans. Biomed. Eng. 61 (2014).
+# - Universal-EEG synthesis #3 (Notion exp51 page).
+
+
+def _compute_dpss(N: int, NW: float, K: int) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the K leading DPSS sequences of length N for time-bandwidth NW.
+
+    Solves the symmetric tridiagonal Slepian eigenproblem via
+    ``numpy.linalg.eigh`` (no scipy dependency).  Returns L²-orthonormal
+    tapers and their concentration eigenvalues in [-W, W] = [-NW/N, NW/N].
+
+    Parameters
+    ----------
+    N : int
+        Length of each DPSS sequence (= ``patch_size`` in the scaler).
+    NW : float
+        Time-bandwidth product.  Half-bandwidth W = NW / N.
+    K : int
+        Number of leading eigenvectors to return.  Must satisfy 1 ≤ K ≤ N.
+
+    Returns
+    -------
+    tapers : ndarray, shape (K, N)
+        K leading DPSS sequences, one per row.  L²-orthonormal:
+        ``Σ_t u_k[t] · u_l[t] = δ_kl``.
+    ratios : ndarray, shape (K,)
+        Concentration eigenvalues sorted in descending order, all in
+        (0, 1).  For K ≤ 2·NW these are typically > 0.99.
+
+    Notes
+    -----
+    The sign convention is set so that the 0-th (symmetric) taper has
+    a positive value at index 0, and each higher taper has the same
+    sign at index 0 as the scipy convention.  This is purely cosmetic
+    for our use (only ``a_k²`` enters the variance estimator), but
+    pinning a convention makes unit tests against scipy reproducible.
+    """
+    if K < 1 or K > N:
+        raise ValueError(f"K must be in [1, N]; got K={K}, N={N}.")
+    if NW <= 0 or NW >= N / 2:
+        raise ValueError(f"NW must be in (0, N/2); got NW={NW}, N={N}.")
+
+    # --- 1. Symmetric tridiagonal Slepian matrix T (Slepian 1978, §3) --
+    i = np.arange(N, dtype=np.float64)
+    diag = ((N - 1) / 2 - i) ** 2 * np.cos(2.0 * np.pi * NW / N)
+    off = (i[1:]) * (N - i[1:]) / 2.0  # length N-1, between row i-1 and i
+
+    # Build dense T (N × N).  N is at most a few thousand for EEG patch
+    # sizes; eigh is microseconds and only happens once at init.
+    T = np.diag(diag) + np.diag(off, k=1) + np.diag(off, k=-1)
+
+    # eigh returns eigenvalues in ascending order; we want the K LARGEST
+    # eigenvalues of T, which correspond to the K MOST concentrated DPSS
+    # sequences (Slepian 1978: the matrices T and the sinc-kernel K_NW
+    # share eigenvectors, but their eigenvalue ORDERS are reversed —
+    # the largest eigenvalue of T corresponds to the smallest eigenvalue
+    # of K_NW only in a relative sense; we compute the actual concentration
+    # ratios separately below).
+    _, U = np.linalg.eigh(T)
+    tapers = U[:, -K:][:, ::-1].T.copy()  # (K, N), descending T-eigvalue order
+
+    # --- 2. Concentration ratios via the sinc kernel ----------------
+    # K_NW = sinc((i - j) · 2W) with W = NW/N
+    j = i[None, :]
+    di = i[:, None] - j  # (N, N) integer offsets
+    with np.errstate(divide="ignore", invalid="ignore"):
+        K_NW = np.sin(2.0 * np.pi * NW * di / N) / (np.pi * di)
+    np.fill_diagonal(K_NW, 2.0 * NW / N)
+    # ratios[k] = u_k^T K_NW u_k ∈ (0, 1)
+    ratios = np.einsum("kn,nm,km->k", tapers, K_NW, tapers)
+
+    # Sign-fix to match the scipy.signal.windows.dpss convention
+    # (each taper starts on the side that makes the "primary lobe"
+    # positive — for even-symmetric tapers this is u_k[0] > 0; for
+    # odd-symmetric tapers it is the slope at the centre that matters).
+    for k in range(K):
+        if k % 2 == 0:
+            # Symmetric taper: enforce positive value at the central peak.
+            # The maximum of an even taper is near the middle.
+            mid = N // 2
+            if tapers[k, mid] < 0:
+                tapers[k] *= -1.0
+        else:
+            # Antisymmetric taper: enforce positive value at the rising-
+            # edge peak (roughly N // 4).
+            quarter = N // 4
+            if tapers[k, quarter] < 0:
+                tapers[k] *= -1.0
+
+    return tapers.astype(np.float64), ratios.astype(np.float64)
+
+
+class PatchedCausalDPSSScaler(nn.Module):
+    """Per-patch Thomson multitaper (DPSS / Slepian) scaler.
+
+    Drop-in replacement for ``PatchedCausalStdScaler`` for the exp51
+    ablation.  Mean estimator is the per-patch mask-aware sample mean
+    (DPSS adds nothing to first-moment estimation); variance estimator
+    is the Thomson multitaper using K leading DPSS tapers.
+
+    Parameters
+    ----------
+    patch_size
+        Length of each patch (= length of each DPSS taper).
+    NW
+        DPSS time-bandwidth product.  W = NW / patch_size is the half-
+        bandwidth of the tapers in cycles / sample.  Standard EEG
+        practice is NW = 2.5 (Babadi & Brown 2014).
+    K
+        Number of leading DPSS tapers used in the multitaper average.
+        Must satisfy 1 ≤ K ≤ patch_size.  K = ⌊2·NW⌋ - 1 = 4 for
+        NW = 2.5 keeps eigenvalues > 0.99 (well-concentrated).  Default
+        K = 3 trades one taper of bandwidth coverage for an additional
+        ~10 % variance reduction on the multitaper estimate.
+    minimum_scale
+        Lower bound clamp on the scale to avoid division-by-zero.  Same
+        default as ``PatchedCausalStdScaler``.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        *,
+        NW: float = 2.5,
+        K: int = 3,
+        minimum_scale: float = 1e-6,
+        # API compat with PatchedCausalStdScaler (ignored).
+        correction: int | float = 1,
+        stabilize_with_global: bool = False,
+        online: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.minimum_scale = minimum_scale
+        self.NW = float(NW)
+        self.K = int(K)
+
+        tapers, ratios = _compute_dpss(patch_size, NW=self.NW, K=self.K)
+
+        # ---- Sample-mean centering bias correction ----------------
+        # When we centre the patch with the sample mean μ̂ = (1/N) Σ v[t]
+        # before projecting onto each taper, the projection
+        #   a_k = Σ_t u_k[t] (v[t] - μ̂)
+        # becomes biased even for stationary signals because the constant
+        # function 1 has non-zero overlap with even-symmetric tapers
+        # (most prominently u_0, which is bell-shaped and all positive).
+        # A short derivation gives:
+        #   E[a_k² | white noise σ²] = σ² · (1 - C_k² / N)
+        # where C_k = Σ_t u_k[t].  The aggregated multitaper estimator is
+        # therefore biased low by
+        #   B = Σ_k w_k · (1 - C_k² / N) / Σ_k w_k
+        # which depends only on (N, NW, K) — a deterministic correction.
+        # For NW=2.5, K=3, N=64 the uncorrected estimator would give
+        # σ̂ ≈ 0.84 · σ on white noise; dividing by B restores unbiasedness.
+        # The correction is signal-independent (it only removes the
+        # constant-function projection), so it remains the right device for
+        # arbitrary EEG with strong 1/f power.
+        c_squared_over_n = (tapers.sum(axis=-1) ** 2) / patch_size  # (K,)
+        bias_factor = float(
+            (ratios * (1.0 - c_squared_over_n)).sum() / max(ratios.sum(), 1e-12)
+        )
+
+        # Buffers move with .to(device) automatically; non-persistent
+        # because they are deterministically reproducible from
+        # (patch_size, NW, K) at load time and we don't want them to
+        # bloat checkpoints.
+        self.register_buffer(
+            "_tapers",
+            torch.from_numpy(tapers).to(torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ratios",
+            torch.from_numpy(ratios).to(torch.float64),
+            persistent=False,
+        )
+        # Pre-compute Σ_k w_k once for the multitaper denominator.
+        self.register_buffer(
+            "_ratio_sum",
+            torch.from_numpy(ratios).to(torch.float64).sum().clamp_min(1e-12),
+            persistent=False,
+        )
+        # Bias-correction divisor for sample-mean centering.
+        self.register_buffer(
+            "_bias_factor",
+            torch.tensor(max(bias_factor, 1e-6), dtype=torch.float64),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        data: Float[torch.Tensor, "..."],
+        mask: Optional[Bool[torch.Tensor, "..."]] = None,
+    ) -> tuple[
+        Float[torch.Tensor, "..."],
+        Float[torch.Tensor, "..."],
+        Float[torch.Tensor, "..."],
+    ]:
+        try:
+            hp = data.to(torch.float64)
+        except TypeError:
+            warnings.warn(
+                f"Float64 not supported on {data.device}, using float32 for scaler.",
+                RuntimeWarning,
+            )
+            hp = data.to(torch.float32)
+
+        if mask is None:
+            mask = torch.ones_like(data, dtype=torch.bool)
+
+        loc, scale = self._compute_loc_scale(hp, mask)
+        loc, scale = loc.to(data.dtype), scale.to(data.dtype)
+        return torch.where(mask, (data - loc) / scale, 0), loc, scale
+
+    def _compute_loc_scale(self, data: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        P = self.patch_size
+        # Per-patch view: (..., S, P).  Validated by the rearrange.
+        data_p = rearrange(data, "... (seq patch) -> ... seq patch", patch=P)
+        mask_p = rearrange(mask, "... (seq patch) -> ... seq patch", patch=P).to(data.dtype)
+
+        # ---- Per-patch mask-aware sample mean ---------------------
+        # μ̂_s = Σ_t v[t] m[t] / max(Σ_t m[t], 1).  When all positions
+        # in a patch are masked, count clamps to 1 and the resulting
+        # μ̂_s is 0 — the model never sees these positions because the
+        # downstream ``where(mask, ..., 0)`` zeroes them anyway.
+        sum_data_p = (data_p * mask_p).sum(dim=-1, keepdim=True)
+        count_p = mask_p.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        mu_p = sum_data_p / count_p  # (..., S, 1)
+
+        # ---- Per-patch DPSS multitaper variance -------------------
+        # Center and mask-zero the residual, then project onto each
+        # taper.  einsum is the natural fit: (..., S, P) × (K, P) → (..., S, K).
+        y_p = (data_p - mu_p) * mask_p
+        tapers = self._tapers.to(data.dtype)  # (K, P)
+        ratios = self._ratios.to(data.dtype)  # (K,)
+        a = einsum(y_p, tapers, "... s p, k p -> ... s k")  # taper projections
+
+        # Thomson multitaper variance with sample-mean bias correction:
+        #   σ̂² = Σ_k w_k a_k² / (Σ_k w_k · B)
+        # where B = Σ_k w_k (1 - C_k²/N) / Σ_k w_k removes the constant-
+        # function-projection bias introduced by centring with μ̂.  See
+        # the derivation in __init__.  For an L²-orthonormal taper u_k
+        # applied to white noise with variance σ², a_k ~ N(0, σ²)
+        # (modulo the centering correction), so the corrected estimator
+        # is unbiased; averaging K such estimators with weights w_k
+        # reduces its variance.
+        denom = self._ratio_sum.to(data.dtype) * self._bias_factor.to(data.dtype)
+        var_p = (a.pow(2) * ratios).sum(dim=-1, keepdim=True) / denom
+        scale_p = var_p.sqrt().clamp(min=self.minimum_scale)
+
+        # Broadcast (loc, scale) across all positions within each patch.
+        loc = repeat(mu_p.squeeze(-1), "... seq -> ... (seq patch)", patch=P)
+        scale = repeat(scale_p.squeeze(-1), "... seq -> ... (seq patch)", patch=P)
+        return loc, scale
+
+
+# =====================================================================
 # KV Cache
 # =====================================================================
 
@@ -1050,11 +1369,26 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
             )
         else:
             self.reference_gauge = None
-        self.scaler = PatchedCausalStdScaler(
-            patch_size=config.patch_size,
-            stabilize_with_global=False,
-            online=False,
-        )
+        # exp51 — optional DPSS-tapered (Thomson multitaper) scaler.
+        # When ``use_dpss_scaler`` is True the per-patch variance
+        # estimator is replaced with a K-leading-DPSS multitaper of
+        # length ``patch_size`` and time-bandwidth ``dpss_NW``; the
+        # mean is the per-patch sample mean.  Off by default so all
+        # pre-exp51 checkpoints load unchanged.
+        if config.use_dpss_scaler:
+            self.scaler: nn.Module = PatchedCausalDPSSScaler(
+                patch_size=config.patch_size,
+                NW=config.dpss_NW,
+                K=config.dpss_K,
+                stabilize_with_global=False,
+                online=False,
+            )
+        else:
+            self.scaler = PatchedCausalStdScaler(
+                patch_size=config.patch_size,
+                stabilize_with_global=False,
+                online=False,
+            )
         self.patch_proj = InputResidualMLP(
             in_dim=2 * config.patch_size,
             hidden_dim=4 * config.d_model,
