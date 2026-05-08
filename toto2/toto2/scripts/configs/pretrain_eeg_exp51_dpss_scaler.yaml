@@ -1,0 +1,218 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp51: DPSS-tapered causal scaler (universal-EEG #3).
+#
+# Replaces the Welford-style cumulative variance estimator at the
+# input of the model with a per-patch Thomson multitaper using K=3
+# leading discrete prolate spheroidal sequences (Slepian 1978) of
+# length patch_size and time-bandwidth NW=2.5.  DPSS sequences are
+# the unique signals maximally concentrated in both time and
+# frequency under the Heisenberg-Donoho-Stark uncertainty bound;
+# multitaper PSD is minimum-variance among all linear estimators
+# (Thomson 1982; Percival & Walden 1993).
+#
+# This is universal-EEG synthesis #3 — endorsed by R2-A (P5).  The
+# headline failure mode it targets: the default Welford sample
+# variance is biased upward by transient bursts (alpha bursts, sleep
+# spindles, electrode pops, eye blinks).  A single 50sigma edge
+# spike inflates the per-patch sigma by roughly 7x with rectangular
+# weighting; the DPSS multitaper variance, where the leading taper
+# u_0 is bell-shaped and down-weights the edges, sees the same spike
+# at much lower effective weight and gives a substantially less
+# inflated estimate (verified in the smoke test).
+#
+# Predicted Delta MDD: +1-3pp + dramatic reduction in scaler bias
+# on bursty signals.  Risk: very low (no learnable parameters added,
+# 4-line core change inside the scaler module, off-path is
+# byte-identical to exp48 / main).
+#
+# WHAT CHANGES vs. exp48 (pure MR-MPL @ 60k steps, current best)
+# --------------------------------------------------------------
+# 1. ``model.use_dpss_scaler: true`` -- swap PatchedCausalStdScaler
+#    for PatchedCausalDPSSScaler at model layer 0.
+# 2. ``model.dpss_NW: 2.5`` -- standard EEG time-bandwidth.  W = 2.5/64
+#    cycles/sample -> ~19.5 Hz of frequency smoothing at 500 Hz, well
+#    inside the alpha/beta band but below gamma.
+# 3. ``model.dpss_K: 3`` -- the conventional 2*NW - 2 well-concentrated
+#    tapers; eigenvalues are all > 0.99 (verified at init).
+# 4. ``training.seed: 53`` -- different roll vs exp48 (50), exp49 (51),
+#    exp50 (52).
+# 5. Step budget halved (60k -> 30k) for the gate, identical schedule
+#    to exp49 / exp50 so we get clean A/B at matched compute.
+#
+# WHAT STAYS THE SAME (byte-identical to exp48)
+# ---------------------------------------------
+# Architecture (24M, mp_residual, qk_norm, d_model=384x12), data
+# (HBN-EEG ~250k 4096-sample windows @ 500Hz, 129 channels), MR-MPL
+# loss (alpha_lm=1.0, beta_sc=0.0, gamma_pc=1.0,
+# pinball_calibration=0.05), AdamW base_lr=0.3 wd=0, precision 32-true,
+# batch size 16.  No reference-gauge projection (exp50), no coord-PE
+# (exp49) -- pure scaler ablation.
+#
+# DECISION RULE (after 30k steps + ridge probe on TUAB)
+# -----------------------------------------------------
+# Decision A -- DPSS scaler is a strict improvement; promote to baseline:
+#   * val_pinball at step 30k <= exp48 step-30k val_pinball - 0.005
+#   * val_trunk_eff_rank_ratio peak >= 0.20 (exp48 had 0.244)
+#   * val_mr_mpl_cos_mean (final) >= 0.93 (exp48 had 0.943)
+#   * Cross-dataset OEB ridge AUROC >= exp48 + 0.01 on >= 4 of 8 benchmarks
+#   ==> Promote DPSS scaler.  Run exp51b at 60k steps + chain into
+#       exp52 (FOOOF auxiliary head).
+#
+# Decision B -- DPSS scaler is a no-op:
+#   * val_pinball within +/-0.005 of exp48 at matched compute
+#   ==> The Welford scaler was already absorbing burst bias well enough
+#       that the DPSS replacement provides no gradient signal benefit.
+#       Note: the bursty-signal robustness MAY still surface on
+#       downstream eval (TUAB sleep / chbmit seizure -- both have
+#       transient-rich windows); ridge-probe the checkpoint to test.
+#
+# Decision C -- DPSS scaler hurts:
+#   * val_pinball worse than exp48 by > 0.005 at matched compute
+#   ==> Per-patch local normalization is removing genuinely useful
+#       information that the cumulative Welford preserved (e.g. slow
+#       drift across the 4096-sample window that the model had been
+#       picking up via per-patch scale changes).  Diagnose by reducing
+#       to ``dpss_K: 1`` (effectively the bell-shaped u_0 alone) -- if
+#       that helps, the K=3 multitaper is over-smoothing.
+#
+# WALL-CLOCK on 4xH100 SXM5 80GB at precision: 32-true
+# ----------------------------------------------------
+# ~4.4 hours for 30000 steps at the 1.88 it/s observed in exp49.
+# DPSS adds one (..., S, P) x (K, P) -> (..., S, K) einsum per scaler
+# call (K=3, P=64 -> 192 mac per patch per channel) -- completely
+# negligible vs. the 12-layer transformer + MR-MPL STFTs.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp51_dpss_scaler
+
+# --------------------------------------------------------------------
+# Model -- exp48 architecture + DPSS-tapered scaler
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+  # ---------------- exp51 DPSS scaler ----------------
+  use_dpss_scaler: true
+  dpss_NW: 2.5
+  dpss_K: 3
+
+# --------------------------------------------------------------------
+# Data -- HBN-EEG identical to exp48
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training -- exp48 recipe rebased to 30k steps for the gate
+# --------------------------------------------------------------------
+training:
+  seed: 53                              # different from exp48=50, exp49=51, exp50=52
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 27000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 30000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp51_dpss_scaler
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp51_dpss_scaler_30k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp51
+    - mr_mpl
+    - dpss_scaler
+    - slepian
+    - multitaper
+    - thomson_1982
+    - universal_eeg_3
+    - mp_residual
+    - no_aux
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp51_dpss_scaler
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 1500

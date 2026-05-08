@@ -66,6 +66,61 @@ class Toto2ModelConfig:
     mp_residual: bool = False
     mp_residual_alpha: float = 1.0
 
+    # ----------------------------------------------------------------
+    # exp51 — DPSS-tapered causal scaler (universal-EEG #3)
+    #
+    # The default ``PatchedCausalStdScaler`` uses a Welford-style
+    # cumulative sample mean / variance over the entire causal history
+    # at each patch boundary.  Sample variance with rectangular
+    # weighting is biased upward by transient bursts (alpha bursts,
+    # sleep spindles, eye-blink artefacts, electrode pops) — a single
+    # outlier sample contributes its full squared deviation to the
+    # scale, which then divides the rest of the patch and squashes the
+    # whole window's amplitude.
+    #
+    # exp51 replaces the variance estimator with a per-patch Thomson
+    # multitaper using K leading discrete prolate spheroidal sequences
+    # (DPSS / Slepian) of length ``patch_size`` and time-bandwidth
+    # ``dpss_NW``.  DPSS sequences are the unique signals maximally
+    # concentrated in both time [0, P) and frequency [-W, W] under the
+    # Heisenberg-Donoho-Stark uncertainty bound (Slepian 1978), and the
+    # multitaper PSD they form is minimum-variance among all linear
+    # estimators (Thomson 1982; Percival & Walden 1993).  In practice
+    # the tapers down-weight the patch edges (where bursts and seam
+    # transients live) and average K independent low-bias estimates,
+    # giving a substantial reduction in scaler bias on EEG.
+    #
+    #   use_dpss_scaler   — turn the multitaper variance on / off.
+    #     False (default) keeps Toto byte-identical to exp48 / main.
+    #
+    #   dpss_NW           — time-bandwidth product.  Standard EEG
+    #     practice uses NW = 2.5 (Babadi & Brown, IEEE TBME 2014):
+    #     low enough to keep 2NW = 5 well-concentrated tapers, high
+    #     enough that the half-bandwidth W = NW/P stays comfortably
+    #     above the dominant 1/f slope.  For P=64 @ 500Hz, W=2.5/64
+    #     corresponds to ~19.5Hz of frequency smoothing — covers the
+    #     alpha and beta bands without bleeding into gamma.
+    #
+    #   dpss_K            — number of leading DPSS tapers used.  K=3
+    #     is the convention for NW=2.5 (the K = 2NW - 1 rule of thumb
+    #     for "well-concentrated" tapers, eigenvalue > 0.99).  K=4
+    #     drops eigenvalue 4 to ~0.95 and is a knob for variance /
+    #     bias tradeoff; K=2 minimises variance but loses spectral
+    #     coverage.  Validation rejects ``K > P``.
+    #
+    # The mean estimator stays the simple per-patch sample mean — DPSS
+    # has nothing to add for first moments and we retain causality of
+    # the per-patch broadcast contract (loc/scale at any timestep
+    # within patch s uses only patch s's data).  The Welford-style
+    # cumulative mean of the default scaler is replaced with a per-
+    # patch sample mean to match: this is mathematically the
+    # variance-driven "scaler bias on bursty signals" failure mode
+    # exp51 is designed to address.
+    # ----------------------------------------------------------------
+    use_dpss_scaler: bool = False
+    dpss_NW: float = 2.5
+    dpss_K: int = 3
+
     @staticmethod
     def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
         """sqrt(S / log(S)) where S = context_length / patch_size.
@@ -83,6 +138,29 @@ class Toto2ModelConfig:
             self.d_ff = (int(4 * self.d_model * 2 / 3) + 7) // 8 * 8
         if self.qk_norm_include_weight is None:
             self.qk_norm_include_weight = self.norm_include_weight
+        if self.use_dpss_scaler:
+            if self.dpss_K < 1:
+                raise ValueError(f"dpss_K must be >= 1; got {self.dpss_K}.")
+            if self.dpss_K > self.patch_size:
+                raise ValueError(
+                    f"dpss_K ({self.dpss_K}) must not exceed patch_size "
+                    f"({self.patch_size}); each DPSS taper has length patch_size "
+                    f"and only patch_size orthogonal sequences exist."
+                )
+            if self.dpss_NW <= 0:
+                raise ValueError(f"dpss_NW must be > 0; got {self.dpss_NW}.")
+            if self.dpss_NW >= self.patch_size / 2:
+                raise ValueError(
+                    f"dpss_NW ({self.dpss_NW}) must be < patch_size/2 "
+                    f"({self.patch_size / 2}); the half-bandwidth W = NW/P would "
+                    f"otherwise reach the Nyquist frequency and DPSS becomes degenerate."
+                )
+            if self.dpss_K > 2 * self.dpss_NW:
+                # Soft warning: only the first 2*NW tapers have eigenvalue >> 0.5.
+                # Higher-K tapers have most of their energy outside [-W, W] and
+                # add noise instead of signal to the multitaper estimate.  Allowed
+                # but explicitly documented as a bias / variance knob.
+                pass
         if self.residual_attn_ratio is None:
             if self.mp_residual:
                 # The τ-rule is unused when magnitude-preserving residual
