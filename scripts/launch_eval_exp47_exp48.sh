@@ -109,6 +109,39 @@ case "${1:-help}" in
     done
     ;;
 
+  exp48_group_a_on_4567)
+    # Same as exp48_all but ONLY group A datasets, mapped to GPUs 4-7.
+    # Used when exp47 group A is still occupying GPUs 0-3.
+    CKPT_EXP48_BEST=$(ls -t "$CKPT_ROOT/toto2_eeg_exp48_mr_mpl_long/"*.ckpt 2>/dev/null \
+      | grep -v last \
+      | sort -t= -k4 -n \
+      | head -1)
+    [[ -f "$CKPT_EXP48_BEST" ]] || { echo "FATAL: no exp48 checkpoint found"; exit 1; }
+    echo "==================================================================="
+    echo "Launching exp48 eval — group A on GPUs 4-7"
+    echo "  checkpoint: $CKPT_EXP48_BEST"
+    echo "==================================================================="
+    for i in "${!GROUP_A[@]}"; do
+      run_one exp48 "$CKPT_EXP48_BEST" "$((i+4))" "${GROUP_A[$i]}"
+    done
+    ;;
+
+  exp48_group_b_on_0123)
+    # exp48 group B datasets on GPUs 0-3.
+    CKPT_EXP48_BEST=$(ls -t "$CKPT_ROOT/toto2_eeg_exp48_mr_mpl_long/"*.ckpt 2>/dev/null \
+      | grep -v last \
+      | sort -t= -k4 -n \
+      | head -1)
+    [[ -f "$CKPT_EXP48_BEST" ]] || { echo "FATAL: no exp48 checkpoint found"; exit 1; }
+    echo "==================================================================="
+    echo "Launching exp48 eval — group B on GPUs 0-3"
+    echo "  checkpoint: $CKPT_EXP48_BEST"
+    echo "==================================================================="
+    for i in "${!GROUP_B[@]}"; do
+      run_one exp48 "$CKPT_EXP48_BEST" "$i" "${GROUP_B[$i]}"
+    done
+    ;;
+
   status)
     for exp in exp47 exp48; do
       out_dir=/opt/dlami/nvme/eeg/runs/eval_${exp}_full
