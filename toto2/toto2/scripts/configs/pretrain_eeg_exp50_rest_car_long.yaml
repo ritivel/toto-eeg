@@ -1,0 +1,173 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp50 LONG: CAR + MR-MPL, 150k steps (5x exp50 short, 2.5x exp48).
+#
+# Pure scaling experiment.  Recipe is BYTE-IDENTICAL to exp50 short
+# except for the step budget.  Same architecture, same data, same loss,
+# same optimizer.  Only ``trainer.max_steps`` and the WSD schedule are
+# scaled up.
+#
+# Designed to run for ~24h on 4xH100 SXM5 80GB on the Mumbai p5.48xlarge,
+# in parallel with exp48_long on the other 4 H100s for a clean A/B at
+# matched compute.
+#
+# WHY 150K STEPS
+# --------------
+# At ~1.78 it/s effective on 4 H100s (exp48 measurement), 150k steps
+# is 23.4 hours wall-clock.  Provides headroom inside a 24h budget
+# while exercising 2.5x exp48's original 60k-step convergence point.
+#
+# HBN-EEG SAMPLING IS NOT THE BOTTLENECK
+# --------------------------------------
+# The LazyNpzTimeSeriesDataset draws a fresh random window-start offset
+# per call.  With 3698 train files and ~150k samples per recording,
+# the unique-window space is ~540M starting positions; 150k steps at
+# batch 64 covers <2% of that space.  No overfitting risk; the
+# 'windows_per_file=64' knob only controls epoch length.
+#
+# DECISION RULE
+# -------------
+# A: val_pinball at step 150k <= 0.180 (vs exp48 final 0.190)
+#    AND val_trunk_eff_rank_ratio peak >= 0.20 (matches exp48 ceiling)
+#    AND val_mr_mpl_cos_mean (final) >= 0.95
+#    => CAR + MR-MPL is the new production recipe.  Save the final
+#       checkpoint for exp51 (DPSS scaler) to build on.
+# B: val_pinball at step 150k within +/- 0.005 of exp48 final
+#    => CAR is no-op on val_pinball but maybe wins downstream (matches
+#       exp50 short's "Decision B" outcome scenario).  Run OEB ridge
+#       probe to check.
+# C: training instability after step 30k (loss spike, NaN)
+#    => bad LR / WSD schedule for the long-run regime.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp50_rest_car_long
+
+# --------------------------------------------------------------------
+# Model — IDENTICAL to exp50 short (CAR + MR-MPL @ exp48 architecture)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+  use_reference_gauge: true
+  reference_gauge_method: car
+  gauge_augment_std: 0.0
+
+# --------------------------------------------------------------------
+# Data — IDENTICAL to exp48 / exp50 short (HBN-EEG, no transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp48/exp50-short recipe stretched 5x with longer decay
+# --------------------------------------------------------------------
+training:
+  seed: 53                              # different from exp48=50, exp49=51, exp50short=52
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 2500                    # 5x exp50 short's 1000 (proportional to total)
+  stable_steps: 140000                  # the bulk of training at peak LR
+  decay_steps: 7500                     # 5x exp50 short's 2000 (longer decay = better convergence quality)
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 150000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 200                # 2x exp50 short to keep wandb log volume sane
+  val_check_interval: 5000              # ~30/run; less frequent than short, more decisions per
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 200
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp50_rest_car_long
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp50_rest_car_long_150k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp50
+    - mr_mpl
+    - reference_gauge
+    - car
+    - universal_eeg_2
+    - mp_residual
+    - no_aux
+    - long_run
+    - scaling_test
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp50_rest_car_long
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 5000

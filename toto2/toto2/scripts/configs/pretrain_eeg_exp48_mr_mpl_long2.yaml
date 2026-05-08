@@ -1,0 +1,163 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp48 LONG2: pure MR-MPL, 150k steps (2.5x exp48's original).
+#
+# Pure scaling experiment.  Recipe is BYTE-IDENTICAL to exp48 except
+# for the step budget and seed.  Same architecture, same data, same
+# loss, same optimizer.  Only ``trainer.max_steps`` and the WSD
+# schedule are scaled up.
+#
+# Purpose: provides the matched-step baseline for exp50_long.  Both
+# runs train on the same data with the same loss for the same number
+# of steps; the ONLY difference is the layer-0 reference-gauge
+# projection.  Side-by-side at step 150k gives a definitive answer to
+# "does CAR help at scale?".
+#
+# Designed to run for ~24h on 4xH100 SXM5 80GB on the Mumbai
+# p5.48xlarge (GPUs 4-7), in parallel with exp50_long on GPUs 0-3.
+#
+# DECISION RULE
+# -------------
+# The decision rules for this run are slaved to exp50_long's: this
+# run is a baseline whose only purpose is to anchor the comparison.
+# Notable single-run questions:
+#
+# 1. Does pure MR-MPL keep improving past 60k?  exp48's 60k endpoint
+#    was val_pinball=0.190 / trunk_eff_rank=0.244.  The 60k val
+#    trajectory was still slowly improving but flattening.  150k
+#    will tell us whether (a) it keeps converging, (b) it flat-lines,
+#    or (c) it overshoots and overfits in the late stable-LR phase.
+#
+# 2. Is the seed=54 noise floor consistent with exp48 (seed=50)?  If
+#    val_pinball at step 60k is within +/- 0.003 of exp48's 0.190,
+#    we have run-to-run reproducibility.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp48_mr_mpl_long2
+
+# --------------------------------------------------------------------
+# Model — IDENTICAL to exp48 (no CAR, no aux, mp_residual)
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+  # No reference gauge — explicitly off so this is a clean baseline.
+
+# --------------------------------------------------------------------
+# Data — IDENTICAL to exp48 (HBN-EEG, no transform)
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+# --------------------------------------------------------------------
+# Training — exp48 recipe stretched 2.5x with proportional WSD
+# --------------------------------------------------------------------
+training:
+  seed: 54                              # different from exp48 (50), exp49 (51),
+                                        # exp50_short (52), exp50_long (53)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 2500                    # 2.5x exp48's 1000 (proportional)
+  stable_steps: 140000                  # 2.5x exp48's 56000
+  decay_steps: 7500                     # 2.5x exp48's 3000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 150000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 200
+  val_check_interval: 5000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 200
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp48_mr_mpl_long2
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp48_mr_mpl_long2_150k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp48
+    - mr_mpl
+    - mp_residual
+    - no_aux
+    - long_run
+    - scaling_test
+    - exp50_long_baseline
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp48_mr_mpl_long2
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 5000
