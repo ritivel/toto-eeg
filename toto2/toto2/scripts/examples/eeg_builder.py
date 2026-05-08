@@ -32,6 +32,7 @@ from toto2.training import (
     LazyNpzTimeSeriesDataset,
     SlidingWindowConfig,
 )
+from toto2.training.montages import load_unit_sphere_positions
 
 
 # ----------------------------------------------------------------------
@@ -188,6 +189,59 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
 
     transform = _resolve_transform(eeg_cfg.get("transform"))
 
+    # exp49 — optional electrode-position montage.  Three accepted forms:
+    #
+    #   data.eeg.electrode_montage: gsn_hydrocel_129
+    #     ↪ load shipped JSON via toto2.training.montages.load_unit_sphere_positions
+    #
+    #   data.eeg.electrode_coords_path: /abs/path/to/positions.npy
+    #     ↪ np.load() the file; expected shape (n_channels, 3)
+    #
+    #   (omitted)
+    #     ↪ no electrode_coords on samples; trains a v3 / exp48-shaped
+    #       model.  Use this when ``model.use_coord_pe`` is False.
+    #
+    # When the model expects coord_pe but the dataset config doesn't
+    # supply coords, the lightning module's _step() raises a clear
+    # error so config drift is caught at first forward pass.
+    montage_name = eeg_cfg.get("electrode_montage")
+    coords_path = eeg_cfg.get("electrode_coords_path")
+    electrode_coords: Optional[np.ndarray] = None
+    if montage_name is not None and coords_path is not None:
+        raise ValueError(
+            "Specify exactly one of data.eeg.electrode_montage / "
+            "data.eeg.electrode_coords_path; not both."
+        )
+    if montage_name is not None:
+        electrode_coords = load_unit_sphere_positions(str(montage_name))
+        print(
+            f"[eeg_builder] electrode_montage={montage_name!r} → "
+            f"{electrode_coords.shape}",
+            flush=True,
+        )
+    elif coords_path is not None:
+        electrode_coords = np.asarray(np.load(coords_path), dtype=np.float32)
+        if electrode_coords.ndim != 2 or electrode_coords.shape[1] != 3:
+            raise ValueError(
+                f"data.eeg.electrode_coords_path must point to a (n_channels, 3) "
+                f"numpy array; got shape {electrode_coords.shape}."
+            )
+        print(
+            f"[eeg_builder] electrode_coords_path={coords_path!r} → "
+            f"{electrode_coords.shape}",
+            flush=True,
+        )
+
+    # When coords are provided we double-check they match expected_channels
+    # so an off-by-one (e.g. 128 HydroCel without Cz) fails at startup
+    # rather than mid-batch.
+    if electrode_coords is not None and expected_channels is not None:
+        if electrode_coords.shape[0] != expected_channels:
+            raise ValueError(
+                f"electrode_coords has {electrode_coords.shape[0]} rows but "
+                f"data.eeg.expected_channels={expected_channels}."
+            )
+
     # Pull patch_size from the model section if present, else fall back to a default.
     patch_size = int(config.get("model", {}).get("patch_size", 64))
     context_length = int(data_cfg.get("context_length", 4096))
@@ -225,6 +279,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
             transform=transform,
             cache_size=cache_size,
             windows_per_file=windows_per_file,
+            electrode_coords=electrode_coords,
         )
         val_ds: Optional[Dataset] = None
         if val_paths:
@@ -236,6 +291,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
                 transform=transform,
                 cache_size=cache_size,
                 windows_per_file=max(1, windows_per_file // 2),
+                electrode_coords=electrode_coords,
             )
         return train_ds, val_ds
 
@@ -249,6 +305,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
         train_recordings,
         sliding_cfg_train,
         transform=transform,
+        electrode_coords=electrode_coords,
     )
 
     val_ds: Optional[Dataset] = None
@@ -263,6 +320,7 @@ def build_datasets(config: Dict[str, Any]) -> Tuple[Dataset, Optional[Dataset]]:
                 val_recordings,
                 sliding_cfg_val,
                 transform=transform,
+                electrode_coords=electrode_coords,
             )
 
     return train_ds, val_ds

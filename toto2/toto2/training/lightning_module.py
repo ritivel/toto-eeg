@@ -518,6 +518,24 @@ class Toto2ForTraining(L.LightningModule):
         # ----- exp27 auxiliary heads / config -----
         self.aux_cfg = _merge_aux_config(auxiliary)
 
+        # exp49 / aux interaction guard: the JEPA target tower deep-copies
+        # the online ``patch_proj`` and replicates the patch-embed call
+        # manually inside ``JEPAHead._target_forward``.  That manual path
+        # does not yet know how to feed the CoordPE features.  Keeping
+        # JEPA + coord_pe together would silently feed the target tower
+        # the wrong-shape input and crash deep inside ``patch_proj``.
+        # The clean fix is a separate experiment (exp50+); for exp49 we
+        # explicitly forbid the combination so the failure is loud.
+        if self.aux_cfg["jepa"]["enabled"] and getattr(
+            self.model, "coord_pe", None
+        ) is not None:
+            raise NotImplementedError(
+                "auxiliary.jepa.enabled=True is not supported alongside "
+                "use_coord_pe=True yet — the JEPA target tower needs to "
+                "be taught how to feed the coord PE through its EMA "
+                "patch_proj copy.  This is on the exp50+ roadmap."
+            )
+
         d_model = self.model.config.d_model
         if self.aux_cfg["jepa"]["enabled"]:
             self.jepa_head = JEPAHead(
@@ -584,6 +602,7 @@ class Toto2ForTraining(L.LightningModule):
         series_ids: torch.Tensor,
         cpm_mask: Optional[torch.Tensor] = None,
         num_return_steps: Optional[int] = None,
+        electrode_coords: Optional[torch.Tensor] = None,
     ):
         """Run a single training/eval forward pass.
 
@@ -606,6 +625,10 @@ class Toto2ForTraining(L.LightningModule):
         num_return_steps
             Optional restriction to the trailing ``num_return_steps`` patch
             tokens (mainly useful for evaluation; ``None`` returns all).
+        electrode_coords
+            Optional ``(B, V, 3)`` unit-sphere positions consumed by the
+            exp49 ``CoordPE`` module.  Required when the underlying
+            model has ``use_coord_pe=True``; ignored otherwise.
 
         Returns
         -------
@@ -620,6 +643,7 @@ class Toto2ForTraining(L.LightningModule):
             cpm_mask=cpm_mask,
             series_ids=series_ids,
             num_return_steps=num_return_steps,
+            electrode_coords=electrode_coords,
         )
 
     # ------------------------------------------------------------------
@@ -784,6 +808,16 @@ class Toto2ForTraining(L.LightningModule):
         target = batch["target"]              # (B, V, context_length + patch_size)
         target_mask = batch["target_mask"]    # (B, V, context_length + patch_size)
         series_ids = batch["series_ids"]      # (B, V)
+        # exp49 — present iff the dataset / collate emits coord positions.
+        electrode_coords = batch.get("electrode_coords")  # (B, V, 3) or None
+
+        if self.model.coord_pe is not None and electrode_coords is None:
+            raise ValueError(
+                "use_coord_pe=True but the batch does not contain "
+                "'electrode_coords'.  Make sure your dataset builder "
+                "passes electrode positions; see "
+                "toto2.scripts.examples.eeg_builder for the reference."
+            )
 
         P = self.model.config.patch_size
         if target.shape[-1] != self.context_length + P:
@@ -836,6 +870,7 @@ class Toto2ForTraining(L.LightningModule):
                     target_mask=input_mask,
                     series_ids=series_ids,
                     cpm_mask=cpm_mask,
+                    electrode_coords=electrode_coords,
                 )
             trunk_act = cap.trunk_act
         else:
@@ -844,6 +879,7 @@ class Toto2ForTraining(L.LightningModule):
                 target_mask=input_mask,
                 series_ids=series_ids,
                 cpm_mask=cpm_mask,
+                electrode_coords=electrode_coords,
             )
             trunk_act = None
         quantiles = outputs.quantiles  # (Q, B, V, n_patches, P)

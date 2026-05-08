@@ -126,6 +126,7 @@ class LazyNpzTimeSeriesDataset(Dataset):
         cache_size: int = 2,
         series_id_offset: int = 0,
         windows_per_file: int = 4,
+        electrode_coords: Optional[np.ndarray] = None,
     ) -> None:
         if not paths:
             raise ValueError("LazyNpzTimeSeriesDataset received an empty path list.")
@@ -138,6 +139,27 @@ class LazyNpzTimeSeriesDataset(Dataset):
         self.windows_per_file = max(1, int(windows_per_file))
         self._cache = _LRUCache(cache_size)
 
+        # exp49 — optional shared montage (1 entry per channel, broadcast over
+        # every recording).  All HBN-EEG recordings use the same GSN-HydroCel
+        # 129 layout so a single (129, 3) array suffices.  If you mix montages
+        # per-file, build separate ``LazyNpzTimeSeriesDataset`` instances and
+        # concatenate them or fall back to :class:`ArrayTimeSeriesDataset`.
+        if electrode_coords is None:
+            self.electrode_coords: Optional[torch.Tensor] = None
+        else:
+            arr = np.asarray(electrode_coords, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                raise ValueError(
+                    "electrode_coords must have shape (n_var, 3); "
+                    f"got {arr.shape}."
+                )
+            if expected_channels is not None and arr.shape[0] != expected_channels:
+                raise ValueError(
+                    f"electrode_coords has {arr.shape[0]} rows but "
+                    f"expected_channels={expected_channels}."
+                )
+            self.electrode_coords = torch.from_numpy(arr.copy())
+
         self._paths: list[str] = sorted(str(p) for p in paths)
         # Worker-process-local cache of (n_channels, n_samples) discovered
         # at first read. Skips files that turn out to be unusable.
@@ -145,7 +167,13 @@ class LazyNpzTimeSeriesDataset(Dataset):
 
         print(
             f"[lazy_npz] indexed {len(self._paths)} files "
-            f"(reporting {len(self._paths) * self.windows_per_file} logical windows)",
+            f"(reporting {len(self._paths) * self.windows_per_file} logical windows"
+            + (
+                f", electrode_coords shape={tuple(self.electrode_coords.shape)}"
+                if self.electrode_coords is not None
+                else ""
+            )
+            + ")",
             flush=True,
         )
 
@@ -221,11 +249,19 @@ class LazyNpzTimeSeriesDataset(Dataset):
         series_ids = torch.full(
             (n_ch,), self.series_id_offset + file_idx, dtype=torch.long,
         )
-        return {
+        sample: dict[str, torch.Tensor] = {
             "target": target,
             "target_mask": target_mask,
             "series_ids": series_ids,
         }
+        if self.electrode_coords is not None:
+            if self.electrode_coords.shape[0] != n_ch:
+                raise RuntimeError(
+                    f"electrode_coords has {self.electrode_coords.shape[0]} "
+                    f"rows but recording has {n_ch} channels."
+                )
+            sample["electrode_coords"] = self.electrode_coords
+        return sample
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         n_files = len(self._paths)

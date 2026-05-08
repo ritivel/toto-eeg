@@ -611,6 +611,258 @@ class OutputResidualMLP(ResidualMLP):
 
 
 # =====================================================================
+# exp49 — Continuous coordinate patch embedding (universal-EEG #1)
+# =====================================================================
+#
+# Two complementary positional-encoding families for EEG patch tokens
+# that respect the underlying spatio-temporal geometry:
+#
+#   1. Random Fourier features ``γ(t, r⃗)`` (Tantillo–Mildenhall et al.,
+#      NeurIPS 2020) lift the 4D coordinate ``(t/T, x, y, z)`` into
+#      ``R^{2F}`` via ``γ = [cos(2π · B [t,r⃗]^⊤), sin(...)]`` with
+#      ``B ∈ R^{F × 4}`` fixed at init from ``N(0, σ_B²I)``.  γ is a
+#      Bochner-dual approximation to *any* shift-invariant kernel on
+#      ``R⁴`` — non-degenerate for distinct (t, r⃗) by construction, so
+#      the model can rely on it from training step 1.
+#
+#   2. Real spherical harmonics ``Y^m_l(θ, φ)`` for l = 0..L give a
+#      rotation-equivariant basis on the 2-sphere (Funk–Hecke: zonal
+#      kernels are diagonal in SH).  ``(L+1)²`` modes; for L = 8 (the
+#      universal-EEG default) that's 81 modes per electrode.  These
+#      are projected through a *zero-initialised* head so the SH
+#      contribution starts at exactly zero — letting the model first
+#      learn from γ, then organically recruit SH structure if useful.
+#
+# The two are summed (dimension-matched at ``2F``) and concatenated
+# with the patch values + mask before the patch-projection MLP.  The
+# net effect is to replace Toto's opaque ``series_id`` (one integer
+# per variate, no spatial info) with a continuous, geometry-aware
+# embedding whose magnitude vs. content tradeoff is decoupled at init.
+#
+# References
+# ----------
+# - Tantillo, Mildenhall, et al. "Fourier Features Let Networks Learn
+#   High-Frequency Functions in Low-Dimensional Domains".
+#   NeurIPS 2020.  https://arxiv.org/abs/2006.10739
+# - Rahimi, Recht.  "Random Features for Large-Scale Kernel Machines".
+#   NeurIPS 2007.
+# - Driscoll, Healy.  "Computing Fourier Transforms and Convolutions
+#   on the 2-Sphere".  Adv. Appl. Math. 1994.  (real SH conventions.)
+# - The universal-EEG synthesis (Notion exp49 page) summarising why
+#   8 of 8 research streams converge on this representation.
+
+
+def _associated_legendre(
+    cos_theta: torch.Tensor,
+    sin_theta: torch.Tensor,
+    max_l: int,
+) -> dict[tuple[int, int], torch.Tensor]:
+    """Compute associated Legendre polynomials ``P_l^m(cos θ)`` for
+    ``l = 0..max_l, m = 0..l`` using numerically-stable recurrences.
+
+    Uses the Condon–Shortley convention (extra ``(-1)^m`` baked into the
+    recurrence below via ``-(2l - 1)·sin_theta``).  Returns a dict mapping
+    ``(l, m)`` to a tensor of the same shape as ``cos_theta``.
+    """
+    P: dict[tuple[int, int], torch.Tensor] = {}
+    P[(0, 0)] = torch.ones_like(cos_theta)
+    for l in range(1, max_l + 1):
+        # Diagonal recurrence: P_l^l = -(2l-1) · sin θ · P_{l-1}^{l-1}.
+        P[(l, l)] = -(2 * l - 1) * sin_theta * P[(l - 1, l - 1)]
+    for l in range(1, max_l + 1):
+        # Sub-diagonal: P_l^{l-1} = (2l-1) · cos θ · P_{l-1}^{l-1}.
+        P[(l, l - 1)] = (2 * l - 1) * cos_theta * P[(l - 1, l - 1)]
+    for m in range(0, max_l + 1):
+        for l in range(m + 2, max_l + 1):
+            # General: P_l^m = ((2l-1)·cos θ·P_{l-1}^m - (l+m-1)·P_{l-2}^m) / (l-m).
+            P[(l, m)] = (
+                (2 * l - 1) * cos_theta * P[(l - 1, m)] - (l + m - 1) * P[(l - 2, m)]
+            ) / (l - m)
+    return P
+
+
+def _real_spherical_harmonics(coords: torch.Tensor, max_l: int) -> torch.Tensor:
+    """Real spherical harmonics ``Y^m_l(θ, φ)`` for ``l = 0..max_l``.
+
+    Parameters
+    ----------
+    coords
+        Unit-sphere positions, shape ``(..., 3)`` (caller is responsible
+        for renormalising — we do *not* re-normalise here so any
+        pre-existing scaling chosen at the dataset layer is honoured).
+    max_l
+        Maximum SH degree.
+
+    Returns
+    -------
+    Tensor of shape ``(..., (max_l+1)²)`` with modes ordered as
+    ``Y^{-l}_l, Y^{-l+1}_l, ..., Y^l_l`` for ``l = 0, 1, ..., max_l``.
+
+    Notes
+    -----
+    Conventions: orthonormal real SH (Driscoll–Healy 1994).  Specifically::
+
+        Y^0_l(θ, φ)  =                     K^0_l · P^0_l(cos θ)
+        Y^m_l(θ, φ)  = √2 · K^m_l · cos(m φ) · P^m_l(cos θ)        (m > 0)
+        Y^{-m}_l(θ,φ)= √2 · K^m_l · sin(m φ) · P^m_l(cos θ)        (m > 0)
+
+    with ``K^m_l = sqrt((2l+1)/(4π) · (l-m)!/(l+m)!)``.  We compute log-
+    factorials via ``math.lgamma`` so ``K^m_l`` is exact for all
+    practically-useful ``l`` (overflow only occurs above ``l ≈ 170``).
+    """
+    if coords.shape[-1] != 3:
+        raise ValueError(f"coords last dim must be 3, got shape {tuple(coords.shape)}.")
+    x, y, z = coords[..., 0], coords[..., 1], coords[..., 2]
+    cos_theta = z.clamp(-1.0, 1.0)
+    sin_theta = (1.0 - cos_theta * cos_theta).clamp_min(0.0).sqrt()
+    safe_sin = sin_theta.clamp_min(1e-12)
+    # cos φ, sin φ via x/y/sin_theta — at the poles (sin_theta ≈ 0) we
+    # collapse to (1, 0) which is harmless because every SH at the pole
+    # satisfies P^m_l(±1) = 0 for m > 0.
+    pole_mask = sin_theta < 1e-9
+    cos_phi = torch.where(pole_mask, torch.ones_like(x), x / safe_sin)
+    sin_phi = torch.where(pole_mask, torch.zeros_like(y), y / safe_sin)
+
+    # Chebyshev recurrence for cos(mφ), sin(mφ) avoids atan2 + cumulative
+    # rounding drift from explicit ``φ = atan2(y, x); cos(m φ) = …``.
+    cos_m = [torch.ones_like(x), cos_phi]
+    sin_m = [torch.zeros_like(x), sin_phi]
+    for _ in range(2, max_l + 1):
+        cos_m.append(2.0 * cos_phi * cos_m[-1] - cos_m[-2])
+        sin_m.append(2.0 * cos_phi * sin_m[-1] - sin_m[-2])
+
+    P = _associated_legendre(cos_theta, sin_theta, max_l)
+
+    out: list[torch.Tensor] = []
+    sqrt2 = math.sqrt(2.0)
+    for l in range(0, max_l + 1):
+        for m in range(-l, l + 1):
+            am = abs(m)
+            # K^m_l with log-gamma (exp + half-log keeps it numerically clean).
+            log_ratio = math.lgamma(l - am + 1) - math.lgamma(l + am + 1)
+            K_lm = math.sqrt((2 * l + 1) / (4 * math.pi)) * math.exp(0.5 * log_ratio)
+            if m == 0:
+                Y_lm = K_lm * P[(l, 0)]
+            elif m > 0:
+                Y_lm = sqrt2 * K_lm * cos_m[m] * P[(l, m)]
+            else:
+                Y_lm = sqrt2 * K_lm * sin_m[am] * P[(l, am)]
+            out.append(Y_lm)
+    return torch.stack(out, dim=-1)
+
+
+class CoordPE(nn.Module):
+    """4D random-Fourier + spherical-harmonic positional encoding for EEG patches.
+
+    Produces a ``(*batch, n_var, n_patches, 2 · num_fourier)`` encoding
+    that combines:
+
+    * γ(t, r⃗) — 4D random Fourier features over ``(t/T, x, y, z)`` with
+      ``B`` fixed at init.  Shape ``(..., V, S, 2F)``, contributes from
+      the very first forward pass.
+    * sh_head(Y_l^m(θ, φ)) — real spherical harmonics through a
+      *zero-initialised* linear head into ``R^{2F}``.  Shape
+      ``(..., V, 2F)`` broadcast over the time-patch axis ``S``.  Starts
+      at zero and grows during training only if useful.
+
+    The two are summed and returned.  The downstream patch-projection
+    MLP (see :class:`Toto2Model`) concatenates this PE with the
+    ``[scaled_patch, mask]`` features and projects to ``d_model``.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_fourier: int = 32,
+        max_l: int = 8,
+        sigma_B: float = 1.0,
+        time_scale: float = 1.0,
+        seed: Optional[int] = None,
+    ):
+        super().__init__()
+        self.num_fourier = int(num_fourier)
+        self.max_l = int(max_l)
+        self.sigma_B = float(sigma_B)
+        self.time_scale = float(time_scale)
+        self.num_sh_modes = (self.max_l + 1) ** 2
+        self.out_dim = 2 * self.num_fourier
+
+        # ---- Fixed random Fourier matrix B ∈ R^{F × 4} ----
+        # B is registered as a buffer so it (a) follows .to(device),
+        # (b) is included in checkpoints, (c) is restored exactly on
+        # load (preserves the encoding deterministically).  It is *not*
+        # a Parameter — the random-Fourier guarantees rely on it being
+        # fixed after init.
+        if seed is not None:
+            generator = torch.Generator().manual_seed(int(seed))
+            B = torch.randn(self.num_fourier, 4, generator=generator) * self.sigma_B
+        else:
+            B = torch.randn(self.num_fourier, 4) * self.sigma_B
+        self.register_buffer("B", B)
+
+        # ---- Zero-initialised SH head ----
+        # Plain nn.Linear (not uu.Linear) — once the weight is exactly
+        # zero, scaling is irrelevant, and once it grows it is
+        # downstream of the u-μP-aware patch_proj where all fan-in
+        # accounting happens.
+        self.sh_head = nn.Linear(self.num_sh_modes, self.out_dim, bias=True)
+        nn.init.zeros_(self.sh_head.weight)
+        nn.init.zeros_(self.sh_head.bias)
+
+    def _patch_centre_times(
+        self,
+        n_patches: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Patch-centre times normalised to ``[0, 1]`` and scaled by ``time_scale``.
+
+        Returns shape ``(n_patches,)``.  Centred sampling — patch ``i`` is at
+        ``(i + 0.5) / n_patches`` — keeps the encoding symmetric under
+        time-axis reflection.
+        """
+        if n_patches <= 0:
+            raise ValueError(f"n_patches must be > 0, got {n_patches}.")
+        t = (torch.arange(n_patches, device=device, dtype=dtype) + 0.5) / float(n_patches)
+        return t * float(self.time_scale)
+
+    def fourier_features(
+        self,
+        coords: Float[torch.Tensor, "*batch n_var 3"],
+        n_patches: int,
+    ) -> Float[torch.Tensor, "*batch n_var n_patches two_f"]:
+        """4D random Fourier features for every (variate, patch) pair."""
+        device = coords.device
+        dtype = coords.dtype
+        t = self._patch_centre_times(n_patches, device=device, dtype=dtype)  # (S,)
+        S = n_patches
+        lead_shape = coords.shape[:-1]  # (*batch, n_var)
+        coords_expanded = coords.unsqueeze(-2).expand(*lead_shape, S, 3)
+        t_view = t.view(*([1] * len(lead_shape)), S, 1).expand(*lead_shape, S, 1)
+        # (*lead, S, 4) in (t, x, y, z) order.
+        txyz = torch.cat([t_view, coords_expanded], dim=-1)
+        proj = 2.0 * math.pi * (txyz @ self.B.to(txyz.dtype).t())
+        return torch.cat([proj.cos(), proj.sin()], dim=-1)
+
+    def sh_features(
+        self,
+        coords: Float[torch.Tensor, "*batch n_var 3"],
+    ) -> Float[torch.Tensor, "*batch n_var num_sh_modes"]:
+        """Real spherical harmonics ``Y_l^m`` for ``l = 0..max_l``, no time axis."""
+        return _real_spherical_harmonics(coords, self.max_l).to(coords.dtype)
+
+    def forward(
+        self,
+        coords: Float[torch.Tensor, "*batch n_var 3"],
+        n_patches: int,
+    ) -> Float[torch.Tensor, "*batch n_var n_patches two_f"]:
+        gamma = self.fourier_features(coords, n_patches)
+        sh = self.sh_features(coords)  # (*lead, V, num_sh_modes)
+        sh_proj = self.sh_head(sh)  # (*lead, V, 2F) — zero at init
+        return gamma + sh_proj.unsqueeze(-2)
+
+
+# =====================================================================
 # Transformer
 # =====================================================================
 
@@ -920,6 +1172,7 @@ class Toto2ModelInputs(TypedDict):
     target: Float[torch.Tensor, "*batch n_var time"]
     target_mask: Bool[torch.Tensor, "*batch n_var time"]
     series_ids: Int[torch.Tensor, "*batch n_var"]
+    electrode_coords: NotRequired[Float[torch.Tensor, "*batch n_var 3"]]
     num_return_steps: NotRequired[Optional[slice]]
 
 
@@ -933,6 +1186,7 @@ class Toto2ForecastInputs(TypedDict):
     target: Float[torch.Tensor, "*batch n_var ctx"]
     target_mask: Bool[torch.Tensor, "*batch n_var ctx"]
     series_ids: Int[torch.Tensor, "*batch n_var"]
+    electrode_coords: NotRequired[Float[torch.Tensor, "*batch n_var 3"]]
     known_dynamic: NotRequired[Float[torch.Tensor, "*batch n_exog ctx+horizon"]]
     known_dynamic_mask: NotRequired[Bool[torch.Tensor, "*batch n_exog ctx+horizon"]]
     known_dynamic_series_ids: NotRequired[Int[torch.Tensor, "*batch n_exog"]]
@@ -947,8 +1201,26 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
             stabilize_with_global=False,
             online=False,
         )
+        # exp49 — coord positional encoding.  When ``use_coord_pe`` is
+        # False this is a literal ``None`` and the model is
+        # byte-identical to v3 / exp48.  When True we extend the patch-
+        # projection input by ``coord_pe.out_dim`` extra channels (a
+        # 4D-Fourier + zero-init-SH-projected coord embedding) and
+        # require the caller to pass ``electrode_coords`` of shape
+        # ``(*batch, n_var, 3)`` to ``forward()``.
+        if config.use_coord_pe:
+            self.coord_pe: Optional[CoordPE] = CoordPE(
+                num_fourier=config.coord_pe_num_fourier,
+                max_l=config.coord_pe_max_l,
+                sigma_B=config.coord_pe_sigma_B,
+                time_scale=config.coord_pe_time_scale,
+            )
+            patch_proj_in_dim = 2 * config.patch_size + self.coord_pe.out_dim
+        else:
+            self.coord_pe = None
+            patch_proj_in_dim = 2 * config.patch_size
         self.patch_proj = InputResidualMLP(
-            in_dim=2 * config.patch_size,
+            in_dim=patch_proj_in_dim,
             hidden_dim=4 * config.d_model,
             out_dim=config.d_model,
             dropout_p=config.dropout_p,
@@ -996,22 +1268,33 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
         cpm_mask: Optional[Bool[torch.Tensor, "*batch n_var time"]],
         series_ids: Int[torch.Tensor, "*batch n_var"],
         num_return_steps: Optional[int] = None,
+        electrode_coords: Optional[Float[torch.Tensor, "*batch n_var 3"]] = None,
     ) -> Toto2ModelOutputs:
         scaled_series, loc, scale = self.scaler(target, target_mask & cpm_mask)
         scaled_series = scaled_series.asinh()
-        x = self.patch_proj(
-            torch.cat(
-                [
-                    rearrange(scaled_series, "... (seq patch) -> ... seq patch", patch=self.config.patch_size),
-                    rearrange(
-                        (~(target_mask & cpm_mask)).to(target.dtype),
-                        "... (seq patch) -> ... seq patch",
-                        patch=self.config.patch_size,
-                    ),
-                ],
-                dim=-1,
-            )
+
+        scaled_patches = rearrange(
+            scaled_series, "... (seq patch) -> ... seq patch", patch=self.config.patch_size
         )
+        mask_patches = rearrange(
+            (~(target_mask & cpm_mask)).to(target.dtype),
+            "... (seq patch) -> ... seq patch",
+            patch=self.config.patch_size,
+        )
+        patch_proj_inputs = [scaled_patches, mask_patches]
+
+        if self.coord_pe is not None:
+            if electrode_coords is None:
+                raise ValueError(
+                    "use_coord_pe=True but electrode_coords were not provided to "
+                    "Toto2Model.forward(). Pass a (*batch, n_var, 3) tensor of "
+                    "unit-sphere-normalised electrode positions."
+                )
+            n_patches = scaled_patches.shape[-2]
+            coord_pe = self.coord_pe(electrode_coords.to(scaled_patches.dtype), n_patches)
+            patch_proj_inputs.append(coord_pe)
+
+        x = self.patch_proj(torch.cat(patch_proj_inputs, dim=-1))
 
         group_ids = repeat(series_ids, "... n_var -> ... n_var seq", seq=x.shape[-2]).clone()
 
@@ -1030,17 +1313,34 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
         quantiles = self.output_head(x, q=None)
         return Toto2ModelOutputs(quantiles, loc, scale)
 
-    def _embed_patches(self, data, mask, patch_size):
-        """Embed time series data into patches with mask."""
-        return self.patch_proj(
-            torch.cat(
-                [
-                    rearrange(data, "... (seq patch) -> ... seq patch", patch=patch_size),
-                    rearrange((~mask).to(data.dtype), "... (seq patch) -> ... seq patch", patch=patch_size),
-                ],
-                dim=-1,
-            )
-        )
+    def _embed_patches(
+        self,
+        data,
+        mask,
+        patch_size,
+        electrode_coords: Optional[torch.Tensor] = None,
+    ):
+        """Embed time series data into patches with mask.
+
+        When ``self.coord_pe`` is enabled, ``electrode_coords`` of shape
+        ``(*batch, n_var, 3)`` is required so the coord PE matches the
+        ``forward()`` path exactly.  Passing ``None`` while coord_pe is
+        active raises (no silent shape mismatch).
+        """
+        scaled_patches = rearrange(data, "... (seq patch) -> ... seq patch", patch=patch_size)
+        mask_patches = rearrange((~mask).to(data.dtype), "... (seq patch) -> ... seq patch", patch=patch_size)
+        parts = [scaled_patches, mask_patches]
+        if self.coord_pe is not None:
+            if electrode_coords is None:
+                raise ValueError(
+                    "Toto2Model._embed_patches: use_coord_pe=True but "
+                    "electrode_coords is None.  Pass electrode positions "
+                    "of shape (*batch, n_var, 3)."
+                )
+            n_patches = scaled_patches.shape[-2]
+            coord_pe = self.coord_pe(electrode_coords.to(scaled_patches.dtype), n_patches)
+            parts.append(coord_pe)
+        return self.patch_proj(torch.cat(parts, dim=-1))
 
     @staticmethod
     def _clamp_nonfinite(vals: torch.Tensor) -> torch.Tensor:

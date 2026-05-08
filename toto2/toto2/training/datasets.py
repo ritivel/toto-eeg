@@ -128,6 +128,13 @@ class ArrayTimeSeriesDataset(Dataset):
     nan_to_num
         Replace ``NaN`` / ``Inf`` with zero in the value tensor. The mask
         will record those positions as unobserved regardless of this flag.
+    electrode_coords
+        Optional ``(n_var, 3)`` array (or per-recording sequence of
+        such arrays) of unit-sphere-normalised electrode positions.
+        When set, every emitted sample carries an ``electrode_coords``
+        tensor that the exp49 ``CoordPE`` module consumes.  Pass
+        ``None`` (default) to fall back to v3 / exp48 behaviour where
+        only ``series_ids`` provide variate identity.
     """
 
     def __init__(
@@ -138,6 +145,7 @@ class ArrayTimeSeriesDataset(Dataset):
         series_ids: Optional[Sequence[Sequence[int]]] = None,
         transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         nan_to_num: bool = True,
+        electrode_coords: Optional[Any] = None,
     ) -> None:
         if len(recordings) == 0:
             raise ValueError("Dataset received no recordings.")
@@ -161,6 +169,44 @@ class ArrayTimeSeriesDataset(Dataset):
                         f"series_ids[{i}] has length {sid.numel()} but recording has "
                         f"{rec.shape[0]} variates."
                     )
+
+        # exp49 — optional electrode_coords (1 per variate, 3-D each).
+        self.electrode_coords: Optional[list[torch.Tensor]]
+        if electrode_coords is None:
+            self.electrode_coords = None
+        else:
+            arr = np.asarray(electrode_coords, dtype=np.float32)
+            if arr.ndim == 2:
+                # Single shared montage broadcast over every recording.
+                if arr.shape[1] != 3:
+                    raise ValueError(
+                        f"electrode_coords must have shape (n_var, 3); got {arr.shape}."
+                    )
+                self.electrode_coords = []
+                for rec in self.recordings:
+                    if arr.shape[0] != rec.shape[0]:
+                        raise ValueError(
+                            f"Recording with {rec.shape[0]} variates does not match "
+                            f"electrode_coords with {arr.shape[0]} positions."
+                        )
+                    self.electrode_coords.append(torch.from_numpy(arr.copy()))
+            elif arr.ndim == 3:
+                # Per-recording montage list.
+                if arr.shape[2] != 3:
+                    raise ValueError(
+                        f"electrode_coords must have last dim 3; got {arr.shape}."
+                    )
+                if arr.shape[0] != len(self.recordings):
+                    raise ValueError(
+                        "Per-recording electrode_coords length does not match "
+                        f"#recordings ({arr.shape[0]} vs {len(self.recordings)})."
+                    )
+                self.electrode_coords = [torch.from_numpy(row.copy()) for row in arr]
+            else:
+                raise ValueError(
+                    "electrode_coords must be (n_var, 3) or (n_recordings, n_var, 3); "
+                    f"got shape {arr.shape}."
+                )
 
         # Per-recording valid start offsets (T - window_len + 1)
         self._max_starts = [
@@ -207,11 +253,14 @@ class ArrayTimeSeriesDataset(Dataset):
         if self.nan_to_num:
             window = torch.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return {
+        sample: dict[str, torch.Tensor] = {
             "target": window,
             "target_mask": finite,
             "series_ids": self.series_ids[rec_idx],
         }
+        if self.electrode_coords is not None:
+            sample["electrode_coords"] = self.electrode_coords[rec_idx]
+        return sample
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         rec_idx, det_start = self._plan[index]
@@ -247,6 +296,7 @@ class ArrayTimeSeriesDataset(Dataset):
         sibling.transform = self.transform
         sibling.nan_to_num = self.nan_to_num
         sibling.series_ids = self.series_ids
+        sibling.electrode_coords = self.electrode_coords
         sibling._max_starts = self._max_starts
         sibling._plan = self._plan
         sibling._rng = np.random.default_rng(self.config.seed)

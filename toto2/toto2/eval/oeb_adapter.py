@@ -18,6 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange, reduce
@@ -26,6 +27,41 @@ from toto2.configuration import Toto2ModelConfig
 from toto2.model import Toto2Model
 
 DEFAULT_CONTEXT_LENGTH = 4096
+
+
+def _coords_from_chs_info(chs_info: Optional[list]) -> Optional[np.ndarray]:
+    """Best-effort extraction of unit-sphere positions from MNE ``info['chs']``.
+
+    open-eeg-bench passes a list of MNE channel-info dicts at build time
+    when the underlying dataset has electrode positions.  Each dict has
+    ``loc`` which is a 12-element vector whose first three components
+    are the (x, y, z) position in metres.  We normalise each row to
+    unit norm so the output is directly usable by ``CoordPE``.
+
+    Returns ``None`` if ``chs_info`` is missing or any channel lacks a
+    valid position.
+    """
+    if not chs_info:
+        return None
+    positions = []
+    for ch in chs_info:
+        loc = None
+        if isinstance(ch, dict):
+            loc = ch.get("loc")
+        else:
+            loc = getattr(ch, "loc", None)
+        if loc is None:
+            return None
+        loc_arr = np.asarray(loc, dtype=np.float64).reshape(-1)
+        if loc_arr.size < 3:
+            return None
+        xyz = loc_arr[:3]
+        if not np.all(np.isfinite(xyz)) or np.linalg.norm(xyz) < 1e-12:
+            return None
+        positions.append(xyz)
+    arr = np.asarray(positions, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / norms
 
 
 class Toto2EEGBenchModel(nn.Module):
@@ -60,6 +96,7 @@ class Toto2EEGBenchModel(nn.Module):
         pool: str = "mean",
         context_length: int = DEFAULT_CONTEXT_LENGTH,
         config_overrides: Optional[dict] = None,
+        electrode_coords: Optional[np.ndarray] = None,
         # open-eeg-bench passes these at build time
         n_times: Optional[int] = None,
         n_outputs: Optional[int] = None,
@@ -101,6 +138,39 @@ class Toto2EEGBenchModel(nn.Module):
             self._load_checkpoint(checkpoint_path)
 
         self.final_layer = nn.Identity()
+
+        # exp49 — resolve electrode coords for downstream eval.  Three
+        # accepted sources, in order of preference:
+        #   1. Explicit ``electrode_coords`` arg (np.ndarray of shape
+        #      (n_chans, 3), unit-sphere normalised).
+        #   2. ``chs_info`` from open-eeg-bench (MNE channel-info dicts
+        #      with 'loc'); we auto-derive unit-sphere positions.
+        #   3. Neither — only OK if the underlying model does not enable
+        #      coord_pe, in which case coords are ignored.
+        coords_buffer: Optional[torch.Tensor] = None
+        if electrode_coords is not None:
+            arr = np.asarray(electrode_coords, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape != (n_chans, 3):
+                raise ValueError(
+                    f"electrode_coords must have shape ({n_chans}, 3); "
+                    f"got {arr.shape}."
+                )
+            coords_buffer = torch.from_numpy(arr.copy())
+        else:
+            inferred = _coords_from_chs_info(chs_info)
+            if inferred is not None and inferred.shape == (n_chans, 3):
+                coords_buffer = torch.from_numpy(inferred.copy())
+        if coords_buffer is not None:
+            self.register_buffer("electrode_coords", coords_buffer)
+        else:
+            self.electrode_coords = None  # type: ignore[assignment]
+            if self._toto.coord_pe is not None:
+                raise ValueError(
+                    "Toto2EEGBenchModel: model uses use_coord_pe=True but no "
+                    "electrode coordinates were provided.  Either pass "
+                    "``electrode_coords`` directly or rely on ``chs_info`` "
+                    "carrying MNE-style channel positions ('loc')."
+                )
 
     def _load_checkpoint(self, path: Union[str, Path]):
         """Load weights from a Lightning .ckpt or plain state_dict file."""
@@ -158,7 +228,23 @@ class Toto2EEGBenchModel(nn.Module):
         scaled, loc, scale = self._toto.scaler(target, target_mask & cpm_mask)
         scaled = scaled.asinh()
 
-        patches = self._toto._embed_patches(scaled, target_mask & cpm_mask, self.patch_size)
+        # exp49 — feed coords through ``_embed_patches`` when CoordPE is on.
+        # ``self.electrode_coords`` is a buffer of shape (n_chans, 3) that
+        # we broadcast over the batch axis; if the model was trained
+        # without coord_pe then it is None and we pass None straight through.
+        embed_kwargs = {}
+        if self.electrode_coords is not None:
+            embed_kwargs["electrode_coords"] = (
+                self.electrode_coords.to(scaled.dtype)
+                .unsqueeze(0)
+                .expand(batch, -1, -1)
+            )
+        patches = self._toto._embed_patches(
+            scaled,
+            target_mask & cpm_mask,
+            self.patch_size,
+            **embed_kwargs,
+        )
 
         group_ids = series_ids.unsqueeze(-1).expand(-1, -1, patches.shape[-2]).clone()
         mask_per_patch = reduce(

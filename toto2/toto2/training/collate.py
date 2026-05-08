@@ -17,7 +17,7 @@ no time padding is required.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 
@@ -30,17 +30,21 @@ def collate_timeseries(
     *,
     pad_series_id: int = _DEFAULT_PAD_SERIES_ID,
 ) -> dict[str, torch.Tensor]:
-    """Collate a list of ``{target, target_mask, series_ids}`` samples.
+    """Collate a list of ``{target, target_mask, series_ids[, electrode_coords]}`` samples.
 
     Parameters
     ----------
     samples
-        Output of an ``ArrayTimeSeriesDataset`` / ``HFTimeSeriesDataset``.
-        Each sample is a dictionary with:
+        Output of an ``ArrayTimeSeriesDataset`` / ``HFTimeSeriesDataset`` /
+        ``LazyNpzTimeSeriesDataset``.  Each sample is a dictionary with:
 
         - ``target`` of shape ``(n_var_i, window_len)``
         - ``target_mask`` of shape ``(n_var_i, window_len)``
         - ``series_ids`` of shape ``(n_var_i,)``
+        - ``electrode_coords`` of shape ``(n_var_i, 3)`` (exp49, optional;
+          must be present in either *every* sample or *no* sample of a
+          batch — mixed batches are rejected so the model never sees a
+          partial coord encoding).
 
     pad_series_id
         Series id used for padded variates. ``-1`` matches Toto 2.0's
@@ -56,6 +60,10 @@ def collate_timeseries(
           across the entire padding variate dimension.
         - ``series_ids``: ``(B, n_var_max)`` — padding variates carry
           ``pad_series_id``.
+        - ``electrode_coords``: ``(B, n_var_max, 3)`` — only present
+          when every input sample carried it. Padded variate rows
+          contain zeros (origin); the trunk masks them out via
+          ``series_ids == pad_series_id``.
         - ``num_variates``: ``(B,)`` — original ``n_var`` per sample.
     """
     if not samples:
@@ -76,16 +84,38 @@ def collate_timeseries(
     series_ids = torch.full((batch_size, n_var_max), pad_series_id, dtype=torch.long)
     num_variates = torch.zeros(batch_size, dtype=torch.long)
 
+    has_coords = ["electrode_coords" in s for s in samples]
+    if any(has_coords) and not all(has_coords):
+        raise ValueError(
+            "electrode_coords must be present in either every sample of a "
+            "batch or none — got a mixed batch.  Make sure your dataset "
+            "consistently emits the field, or do not enable use_coord_pe."
+        )
+    electrode_coords: Optional[torch.Tensor] = None
+    if all(has_coords):
+        electrode_coords = torch.zeros(batch_size, n_var_max, 3, dtype=torch.float32)
+
     for b, sample in enumerate(samples):
         v = sample["target"].shape[0]
         target[b, :v] = sample["target"].to(torch.float32)
         target_mask[b, :v] = sample["target_mask"].to(torch.bool)
         series_ids[b, :v] = sample["series_ids"].to(torch.long)
+        if electrode_coords is not None:
+            ec = sample["electrode_coords"]
+            if ec.shape != (v, 3):
+                raise ValueError(
+                    f"Sample {b} has electrode_coords shape {tuple(ec.shape)} "
+                    f"but expected ({v}, 3)."
+                )
+            electrode_coords[b, :v] = ec.to(torch.float32)
         num_variates[b] = v
 
-    return {
+    out: dict[str, torch.Tensor] = {
         "target": target,
         "target_mask": target_mask,
         "series_ids": series_ids,
         "num_variates": num_variates,
     }
+    if electrode_coords is not None:
+        out["electrode_coords"] = electrode_coords
+    return out

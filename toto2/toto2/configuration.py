@@ -66,6 +66,56 @@ class Toto2ModelConfig:
     mp_residual: bool = False
     mp_residual_alpha: float = 1.0
 
+    # ----------------------------------------------------------------
+    # exp49 — Continuous coordinate patch embedding (universal-EEG #1)
+    #
+    #   use_coord_pe              — enable the spatio-temporal coord
+    #     positional encoding.  When False all other coord_pe_* fields
+    #     are ignored and Toto2Model behaves byte-identically to v3 —
+    #     i.e., a single ``series_id`` per variate, no spatial info.
+    #
+    #   coord_pe_num_fourier      — number of random Fourier feature
+    #     pairs (one cos + one sin = two output dims per pair).  The
+    #     random matrix B ∈ R^{num_fourier × 4} maps (t, x, y, z) into
+    #     R^{num_fourier} and the cos/sin lift produces a 2*num_fourier
+    #     dimensional encoding γ(t, r⃗) per (variate, patch) token.
+    #     Default 32 (= 64-d encoding) matches the spec in the
+    #     universal-EEG synthesis (see Notion exp49 design doc).
+    #
+    #   coord_pe_max_l            — maximum spherical-harmonic degree.
+    #     The full set of Y^m_l for l = 0..L gives (L+1)^2 modes, all
+    #     real-valued (we use the standard real spherical harmonics).
+    #     Default 8 → 81 modes, matching the universal-EEG spec.  These
+    #     modes are computed once per electrode (no time dependence)
+    #     and projected through a *zero-initialised* head whose output
+    #     is summed onto the Fourier features before concatenation
+    #     with the patch values.  Zero-init makes the SH branch start
+    #     contributing nothing so the model first learns to use the
+    #     Fourier features (which are non-degenerate for the same
+    #     hyperparameters at every electrode), and only later — if
+    #     useful — picks up the rotation-equivariant SH structure.
+    #
+    #   coord_pe_sigma_B          — std of the random Fourier matrix B
+    #     entries.  Larger σ_B = higher-frequency PE = more local
+    #     resolution but also more aliasing-style noise.  Default 1.0
+    #     is a safe starting point for unit-sphere coordinates and
+    #     unit-normalised time.  Tantillo–Mildenhall et al. ("Fourier
+    #     Features Let Networks Learn High-Frequency Functions in Low-
+    #     Dimensional Domains", NeurIPS 2020) recommend tuning σ_B per
+    #     domain; we expose it as a knob rather than committing to one.
+    #
+    #   coord_pe_time_scale       — multiplier applied to the
+    #     normalised patch-centre time (in [0, 1]) before being fed
+    #     into B.  1.0 = treat time on the same footing as the unit-
+    #     sphere coordinates; values > 1 give time more bandwidth
+    #     (useful at very long context lengths).  Default 1.0.
+    # ----------------------------------------------------------------
+    use_coord_pe: bool = False
+    coord_pe_num_fourier: int = 32
+    coord_pe_max_l: int = 8
+    coord_pe_sigma_B: float = 1.0
+    coord_pe_time_scale: float = 1.0
+
     @staticmethod
     def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
         """sqrt(S / log(S)) where S = context_length / patch_size.
@@ -83,6 +133,22 @@ class Toto2ModelConfig:
             self.d_ff = (int(4 * self.d_model * 2 / 3) + 7) // 8 * 8
         if self.qk_norm_include_weight is None:
             self.qk_norm_include_weight = self.norm_include_weight
+        if self.use_coord_pe:
+            if self.coord_pe_num_fourier <= 0:
+                raise ValueError(
+                    f"coord_pe_num_fourier must be > 0 when use_coord_pe is True; "
+                    f"got {self.coord_pe_num_fourier}."
+                )
+            if self.coord_pe_max_l < 0:
+                raise ValueError(
+                    f"coord_pe_max_l must be >= 0 when use_coord_pe is True; "
+                    f"got {self.coord_pe_max_l}."
+                )
+            if self.coord_pe_sigma_B <= 0:
+                raise ValueError(
+                    f"coord_pe_sigma_B must be > 0 when use_coord_pe is True; "
+                    f"got {self.coord_pe_sigma_B}."
+                )
         if self.residual_attn_ratio is None:
             if self.mp_residual:
                 # The τ-rule is unused when magnitude-preserving residual

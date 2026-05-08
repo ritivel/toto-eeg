@@ -1,0 +1,227 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp49: Continuous coordinate patch embedding for EEG.
+#
+# Universal-EEG synthesis #1 (highest ROI, all-stream-endorsed): replace
+# the opaque ``series_id`` (one integer per electrode, no spatial info)
+# with a continuous, geometry-aware patch embedding that combines:
+#
+#   * γ(t, r⃗) — 4D random Fourier features lifting (t/T, x, y, z) into
+#     R^{2F} via ``γ = [cos(2π · B [t,r⃗]^⊤), sin(...)]`` with B fixed
+#     at init from N(0, σ_B²I).  Non-degenerate at distinct (t, r⃗) by
+#     construction → contributes from training step 1.
+#
+#   * Y_l^m(θ, φ) — real spherical harmonics for l = 0..8 (= 81 modes
+#     per electrode) projected through a *zero-initialised* head into
+#     the same 2F dim.  SH contribution starts at zero and grows only
+#     when useful → no architectural commitment, just an option.
+#
+# Both feature families are summed and concatenated alongside the patch
+# values + mask before the patch-projection MLP, so ``in_dim`` grows
+# from ``2 * patch_size = 128`` to ``128 + 64 = 192``.
+#
+# WHAT CHANGES vs. exp48 (pure MR-MPL @ 60k steps, current best)
+# --------------------------------------------------------------
+# 1. ``model.use_coord_pe: true`` (the headline change)
+# 2. ``model.coord_pe_*`` knobs (defaults follow the universal-EEG spec
+#    line-by-line; no surprises).
+# 3. ``data.eeg.electrode_montage: gsn_hydrocel_129`` — wires the
+#    HBN-EEG GSN HydroCel-129 unit-sphere positions through the
+#    dataset → collate → forward path.
+# 4. Step budget halved relative to exp48 (60k → 30k) because the
+#    headline metric we want to read out is the early-training
+#    trajectory of ``val_pinball`` and ``val_trunk_eff_rank_ratio``
+#    against exp48 at matched compute, not a 60k-step asymptote.
+#    A second 60k-step run is gated on this 30k-step gate (see
+#    Notion exp49 page Decision rule).
+# 5. seed 50 → 51.
+#
+# WHAT STAYS THE SAME
+# -------------------
+# Everything else is byte-identical to exp48:
+#   * MR-MPL config (alpha_lm=1.0, beta_sc=0.0, gamma_pc=1.0,
+#     pinball_calibration_weight=0.05, fft_sizes=[64,256,1024]).
+#   * Architecture (24M, mp_residual, qk_norm, d_model=384x12).
+#   * Data (HBN-EEG, ~250k 4096-sample windows @ 500Hz, 129 channels).
+#   * Optimizer (AdamW, base_lr=0.3, wd=0).
+#   * Precision (32-true), gradient_clip_val=1.0.
+#   * Batch size 16 (no auxiliaries, no JEPA EMA copy).
+#
+# DECISION RULE (after 30k steps + ridge probe on TUAB)
+# -----------------------------------------------------
+# Decision A (coord-PE is a strict improvement; promote to baseline):
+#   * val_pinball at step 30k <= exp48 step-30k val_pinball - 0.005
+#   * val_trunk_eff_rank_ratio peak >= 0.20 (matches exp48's 0.244 ±)
+#   * val_mr_mpl_cos_mean (final) >= 0.93 (within 1pp of exp48's 0.943)
+#   * TUAB ridge AUROC >= exp48 + 0.01
+#   ⇒ Promote coord-PE.  Run exp49b at 60k steps + chain into exp50
+#     (REST/CAR gauge layer + random-reference augmentation).
+#
+# Decision B (coord-PE is a no-op or hurts at 30k steps):
+#   * val_pinball within ±0.005 of exp48 at matched compute
+#   ⇒ Either σ_B is wrong (try 0.5 / 2.0), or HydroCel-129 positions
+#     don't help on HBN-EEG specifically (a real surprise — would
+#     mean Toto's variate attention was already implicitly recovering
+#     spatial structure from series_ids).  Diagnose via Notion exp49
+#     post-mortem before launching exp50.
+#
+# Decision C (training instability):
+#   * NaN / loss spike in the first 5000 steps
+#   ⇒ Most likely cause: σ_B too high → high-frequency aliasing of
+#     coord PE → asinh-saturated patch_proj output.  Drop σ_B to 0.5
+#     and rerun the smoke.
+#
+# DIAGNOSTICS (read in WandB / TB during training)
+# ------------------------------------------------
+# * val_pinball                 — primary metric, A/B vs exp48
+# * val_mr_mpl_cos_mean / pc    — phase-coherence stays healthy
+# * val_trunk_eff_rank_ratio    — healthier trunk = bigger downstream win
+# * grad_norm                   — should land in [1e-4, 1e1]
+# * coord_pe.B (buffer at init) — sanity check: stored once, restored
+#   exactly across train/eval (same encoding everywhere).
+#
+# WALL-CLOCK on 4xH100 SXM5 80GB at precision: 32-true
+# ----------------------------------------------------
+# ~4.7 hours for 30000 steps (matches exp48's 60000-step / 9.4-hour
+# pace; coord-PE adds a few % overhead from the Fourier + SH compute,
+# negligible vs. the 12-layer transformer + MR-MPL STFTs).
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp49_coord_pe
+
+# --------------------------------------------------------------------
+# Model — exp48 architecture + coord-PE patch embedding
+# --------------------------------------------------------------------
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+  # ---------------- exp49 coord-PE ----------------
+  use_coord_pe: true
+  coord_pe_num_fourier: 32        # → γ has 64 dims (cos + sin)
+  coord_pe_max_l: 8               # → 81 SH modes (l = 0..8)
+  coord_pe_sigma_B: 1.0           # universal-EEG default
+  coord_pe_time_scale: 1.0        # treat normalised time on par with x/y/z
+
+# --------------------------------------------------------------------
+# Data — HBN-EEG identical to exp48 + GSN HydroCel-129 montage
+# --------------------------------------------------------------------
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+    # exp49 — load unit-sphere-normalised electrode positions.
+    # gsn_hydrocel_129 is a precomputed JSON shipped under
+    # toto2.training.montages so workers do not need MNE at runtime.
+    electrode_montage: gsn_hydrocel_129
+
+# --------------------------------------------------------------------
+# Training — exp48 recipe rebased to 30k steps for the gate
+# --------------------------------------------------------------------
+training:
+  seed: 51                              # different from exp48 (50), exp47 (49), exp46 (48)
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 1000
+  stable_steps: 27000
+  decay_steps: 2000
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05                     # only used by pinball calib term
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 30000
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 1500
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 100
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp49_coord_pe
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp49_coord_pe_30k
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp49
+    - mr_mpl
+    - coord_pe
+    - fourier_features
+    - spherical_harmonics
+    - hydrocel_129
+    - universal_eeg_1
+    - mp_residual
+    - no_aux
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp49_coord_pe
+  filename: "{epoch}-{step}-{val_loss:.4f}-{train_mr_mpl_step:.3e}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 5
+  save_last: true
+  every_n_train_steps: 1500
