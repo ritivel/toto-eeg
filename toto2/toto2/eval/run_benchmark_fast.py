@@ -80,7 +80,10 @@ def main():
     parser.add_argument("--pool", type=str, default="mean", choices=["mean", "cls"])
     parser.add_argument("--output", type=str, required=True, help="Output CSV path (incremental writes)")
     # Optimization knobs (with sensible defaults)
-    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers per training job")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers per training job. Default 0 because OEB wraps "
+                             "the dataset transform in a closure that fails to pickle for spawn workers; "
+                             "with preload=True the data is already in RAM so num_workers=0 is fast enough.")
     parser.add_argument("--batch-size", type=int, default=256, help="Per-batch samples (was 64 in stock)")
     parser.add_argument("--max-epochs", type=int, default=30, help="Cap SGD epochs (was 50)")
     parser.add_argument("--patience", type=int, default=5, help="Early-stopping patience (was 10)")
@@ -99,6 +102,56 @@ def main():
     from open_eeg_bench.experiment import collect_completed_results
     from open_eeg_bench.default_configs.experiments import make_all_experiments
     from open_eeg_bench.backbone import PretrainedBackbone
+
+    # ---- Monkey-patch OEB Dataset.setup() to use a TOP-LEVEL callable instead
+    # of a closure for the normalization transform. The original closure can't
+    # be pickled, so num_workers > 0 fails. This patch makes num_workers=N work.
+    if args.num_workers > 0:
+        from open_eeg_bench import dataset as oeb_dataset
+
+        class _PicklableNormTransform:
+            def __init__(self, normalization, old_transform):
+                self.norm = normalization
+                self.old = old_transform
+
+            def __call__(self, x):
+                x = self.norm.apply(x)
+                if self.old is not None:
+                    x = self.old(x)
+                return x
+
+        _orig_setup = oeb_dataset.Dataset.setup
+
+        def _patched_setup(self, normalization):
+            windows = self.load()
+            if self.montage_name is not None:
+                import mne
+                montage = mne.channels.make_standard_montage(self.montage_name)
+                for ds in windows.datasets:
+                    if hasattr(ds, "raw") and ds.raw is not None:
+                        ds.raw.set_montage(montage)
+                    else:
+                        ds.windows.set_montage(montage)
+            for ds in windows.datasets:
+                ds.transform = _PicklableNormTransform(normalization, ds.transform)
+            sample_x, sample_y, _ = windows[0]
+            n_times = sample_x.shape[-1]
+            ds0 = windows.datasets[0]
+            mne_info = (ds0.raw.info if hasattr(ds0, "raw") and ds0.raw is not None
+                        else ds0.windows.info)
+            sfreq = mne_info["sfreq"]
+            chs_info = mne_info["chs"]
+            n_chans = len(chs_info)
+            n_outputs = self.n_classes if self.n_classes is not None else 1
+            metadata = windows.get_metadata().reset_index(drop=True)
+            train_set, val_set, test_set = self.splitter.split(windows, metadata)
+            info = dict(n_chans=n_chans, n_times=n_times, n_outputs=n_outputs,
+                        sfreq=sfreq, chs_info=chs_info)
+            return windows, train_set, val_set, test_set, info
+
+        oeb_dataset.Dataset.setup = _patched_setup
+        print(f"[fast-eval] Patched OEB Dataset.setup for picklable normalization "
+              f"(needed for num_workers={args.num_workers})", flush=True)
 
     peft_modules = None
     if any(s in args.strategies for s in ["lora", "ia3", "adalora", "dora", "oft"]):
