@@ -124,7 +124,9 @@ trainer:
   precision: 32-true
   gradient_clip_val: 1.0
   log_every_n_steps: 200
-  val_check_interval: 5000
+  val_check_interval: 2000              # every 2000 BATCHES per epoch (Lightning int semantics);
+                                        # ~75 vals over the run.  Must be < batches-per-epoch
+                                        # (3684 here = 236672 windows / batch_64).
   check_val_every_n_epoch: null
   num_sanity_val_steps: 0
   refresh_rate: 200
