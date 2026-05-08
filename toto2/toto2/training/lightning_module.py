@@ -792,6 +792,17 @@ class Toto2ForTraining(L.LightningModule):
                 f"= {self.context_length + P}, but got {target.shape[-1]}."
             )
 
+        # exp50 — when use_reference_gauge=True, apply CAR to the FULL window
+        # (input + gt) BEFORE splitting so both halves live in the same
+        # gauge-quotiented space.  Otherwise loc / scale (computed on
+        # CAR'd input) and gt_next (un-CAR'd) sit in different reference
+        # frames and the loss develops a per-recording mean shift that
+        # the model cannot predict by construction.  See exp50 smoke
+        # post-mortem (val_pinball=4.06 with use_reference_gauge=True
+        # vs exp46 baseline ~0.6) for the failure mode.
+        if self.model.reference_gauge is not None:
+            target = self.model.reference_gauge(target, target_mask, series_ids)
+
         # Split into model input (length context_length) and shifted ground truth
         input_target = target[..., : self.context_length]
         input_mask = target_mask[..., : self.context_length]

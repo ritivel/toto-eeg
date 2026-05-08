@@ -103,6 +103,22 @@ def test_car_augmentation_is_training_only_no_op():
     assert torch.equal(out_a, out_b)
 
 
+def test_car_is_idempotent():
+    """CAR is a projection: ``P^2 = P``, so applying CAR twice equals once.
+
+    This matters because the lightning ``_step`` path applies CAR to the
+    full ``target`` window before splitting, and ``Toto2Model.forward``
+    applies CAR again to ``input_target``.  Idempotence means the
+    second application is a no-op rather than a bug — but only if it
+    is true.  Pin it down.
+    """
+    target, target_mask, series_ids = _make_target()
+    car = ReferenceGaugeProjection().eval()
+    once = car(target, target_mask, series_ids)
+    twice = car(once, target_mask, series_ids)
+    assert torch.allclose(once, twice, atol=1e-6)
+
+
 def test_car_augmentation_is_no_op_on_output_in_train_mode():
     """CAR is invariant to the augmentation by construction.
 
@@ -234,6 +250,72 @@ def test_model_off_path_byte_identical_to_v3():
     out_a = model_a(target=target, target_mask=mask, cpm_mask=mask, series_ids=series_ids)
     out_b = model_b(target=target, target_mask=mask, cpm_mask=mask, series_ids=series_ids)
     assert torch.equal(out_a.quantiles, out_b.quantiles)
+
+
+def test_lightning_step_co_projects_input_and_gt():
+    """End-to-end: with use_reference_gauge=True, the lightning ``_step``
+    path must apply CAR to the FULL window (input + gt) before splitting,
+    so loc / scale (computed inside the model on CAR'd input) and
+    gt_next (used to compute the loss) live in the same frame.
+
+    Concretely: feed a recording with a deliberate ``+c·1`` per-timestep
+    constant (a synthetic reference offset).  With CAR enabled, the
+    training step's loss should be ~identical to the same recording
+    with the constant removed by hand, because both halves of the
+    window get projected.  The pre-fix version of this test would
+    blow up (val_pinball ~5x worse, val_amp_ratio ~0.16, val_cos_mean
+    flipped negative — exactly what we observed in the broken smoke).
+    """
+    pytest.importorskip("dd_unit_scaling")
+    from toto2.training import Toto2ForTraining
+
+    cfg = _tiny_config(use_reference_gauge=True)
+    P = cfg.patch_size
+    context_length = 64
+    module = Toto2ForTraining(
+        config=cfg,
+        context_length=context_length,
+        base_lr=1e-3,
+        warmup_steps=0,
+        stable_steps=10,
+        decay_steps=0,
+    )
+    module.setup("fit")
+
+    B, V = 1, 4
+    g = torch.Generator().manual_seed(0)
+    base = torch.randn(B, V, context_length + P, generator=g)
+    target_mask = torch.ones(B, V, context_length + P, dtype=torch.bool)
+    series_ids = torch.zeros(B, V, dtype=torch.long)
+
+    # Two batches: one with a per-timestep offset, one without.
+    offset = 5.0 * torch.randn(B, 1, context_length + P, generator=g)
+    batch_clean = {
+        "target": base,
+        "target_mask": target_mask,
+        "series_ids": series_ids,
+        "num_variates": torch.tensor([V] * B, dtype=torch.long),
+    }
+    batch_offset = {
+        "target": base + offset,
+        "target_mask": target_mask,
+        "series_ids": series_ids,
+        "num_variates": torch.tensor([V] * B, dtype=torch.long),
+    }
+
+    module.eval()
+    loss_clean = module.validation_step(batch_clean, batch_idx=0).item()
+    loss_offset = module.validation_step(batch_offset, batch_idx=0).item()
+
+    # Both must be finite, and the offset must not change the loss
+    # by more than tiny float roundoff.  Without the CAR-on-gt fix
+    # this difference was on the order of >>1.
+    delta = abs(loss_clean - loss_offset)
+    assert delta < 1e-3, (
+        f"loss_clean={loss_clean:.6f}  loss_offset={loss_offset:.6f}  "
+        f"|delta|={delta:.6f}.  "
+        f"CAR-on-gt projection in _step is broken."
+    )
 
 
 def test_config_validates_method():
