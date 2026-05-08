@@ -1,0 +1,156 @@
+# --------------------------------------------------------------------
+# Toto 2.0 — exp50 SMOKE (pre-flight check, ~6 min on 4xH100).
+#
+# A 500-step variant of pretrain_eeg_exp50_rest_car.yaml whose ONLY
+# purpose is to verify the CAR plumbing is healthy on the AWS box
+# BEFORE committing GPU-hours to the full 30000-step run.
+#
+# This smoke does ONE special thing: ``gauge_augment_std: 5.0``.
+# CAR is mathematically invariant to a per-(batch, timestep) constant
+# offset added to the input.  So injecting a *huge* random constant
+# (5σ on the asinh-z-scored EEG, before scaling) and watching that
+# the loss trajectory still matches a coord-PE-free baseline is the
+# cleanest stress-test for the CAR mask handling.  Any pathway that
+# silently bypasses the projection (e.g. a buggy mask, a numerical
+# overflow in the mean computation) will instantly surface as a
+# val-loss explosion.
+#
+# SUCCESS CRITERIA (record against pre-registered hypotheses)
+# -----------------------------------------------------------
+# A. ``train_mr_mpl`` and ``val_mr_mpl`` both decreasing (no
+#    augment-driven explosion).  Specifically: val_mr_mpl at step
+#    500 should be within 5% of exp46's smoke val_mr_mpl at step 500
+#    (a known-good pinball-on-CAR-free-data reference).
+# B. ``train_mr_mpl_cos_mean_mean`` past 0.3 within 500 steps.
+# C. ``train_mr_mpl_amp_ratio_mean`` in [0.3, 2.0].
+# D. ``grad_norm`` finite, in [1e-4, 1e1].
+# E. NO NaN / Inf in any logged value.
+# F. Wall-clock < 10 min on 4xH100 SXM5 80GB at precision: 32-true.
+#
+# IF any of A-F fails, do NOT relaunch the full run.  Most likely
+# diagnosis: the CAR mask handling has a numerical issue; turn off
+# the augmentation (``gauge_augment_std: 0.0``) and rerun the smoke.
+# If THAT also fails, the issue is in CAR itself, not the augmentation.
+# --------------------------------------------------------------------
+
+mode: from_scratch
+
+output_dir: /opt/dlami/nvme/eeg/runs/toto2_eeg_exp50_rest_car_smoke
+
+model:
+  patch_size: 64
+  d_model: 384
+  num_heads: 6
+  num_layers: 12
+  layer_group_size: 12
+  num_variate_layers_per_group: 1
+  variate_layer_first: false
+  num_output_patches: 1
+  qk_norm: true
+  norm_include_weight: false
+  per_dim_scale: false
+  use_xpos: false
+  residual_mult: 1.0
+  residual_attn_ratio: 1.0
+  sigma_reparam: false
+  mp_residual: true
+  mp_residual_alpha: 1.0
+  use_reference_gauge: true
+  reference_gauge_method: car
+  gauge_augment_std: 5.0           # ON for the smoke — stress-tests the projection
+
+data:
+  context_length: 4096
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  multiprocessing_context: fork
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+  eeg:
+    data_root: /opt/dlami/nvme/eeg/npy
+    train_glob: "sub-*/task-*.npy"
+    val_glob: null
+    val_fraction: 0.05
+    array_key: data
+    sfreq: 500
+    expected_channels: 129
+    sliding_stride: 2048
+    min_observed_frac: 0.8
+    lazy: true
+    cache_size: 2
+    windows_per_file: 64
+    transform:
+      type: none
+
+training:
+  seed: 52
+  optimizer: adamw
+  base_lr: 0.3
+  min_lr: 1.5e-2
+  warmup_steps: 50
+  stable_steps: 400
+  decay_steps: 50
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  huber_kappa: 0.05
+  log_grad_norm: true
+  compile: false
+  matmul_precision: high
+
+  loss_type: mr_mpl
+  mr_mpl:
+    fft_sizes: [64, 256, 1024]
+    hop_sizes: [16, 64,  256]
+    win_sizes: null
+    alpha_lm: 1.0
+    beta_sc:  0.0
+    gamma_pc: 1.0
+    pinball_calibration_weight: 0.05
+
+trainer:
+  max_steps: 500
+  accumulate_grad_batches: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  val_check_interval: 100
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  refresh_rate: 10
+  accelerator: gpu
+  devices: 4
+  strategy: ddp_find_unused_parameters_false
+
+logging:
+  save_dir: /opt/dlami/nvme/eeg/runs/lightning_logs
+  name: toto2_eeg_exp50_rest_car_smoke
+  tensorboard: true
+  csv: true
+  wandb: true
+  wandb_project: toto2-eeg
+  wandb_run_name: hbn_exp50_rest_car_smoke_500steps
+  wandb_tags:
+    - hbn
+    - from_scratch
+    - mumbai_h100
+    - exp50
+    - mr_mpl
+    - reference_gauge
+    - car
+    - smoke
+    - preflight
+    - gauge_augment_stress_test
+  wandb_log_model: false
+
+checkpoint:
+  dirpath: /opt/dlami/nvme/eeg/runs/checkpoints/toto2_eeg_exp50_rest_car_smoke
+  filename: "{epoch}-{step}-{val_loss:.4f}"
+  monitor: val_loss
+  mode: min
+  save_top_k: 1
+  save_last: true
+  every_n_train_steps: 250

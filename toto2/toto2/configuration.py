@@ -66,6 +66,53 @@ class Toto2ModelConfig:
     mp_residual: bool = False
     mp_residual_alpha: float = 1.0
 
+    # ----------------------------------------------------------------
+    # exp50 — Reference-electrode gauge projection (universal-EEG #2)
+    #
+    # EEG voltages are physically defined only up to an additive
+    # per-timestep constant: any choice of reference electrode shifts
+    # every channel by the same scalar.  Helmholtz reciprocity (1853)
+    # makes this rigorous: ``v = K · j`` is invariant under
+    # ``v -> v + c·1``.  The model SHOULD therefore live on the
+    # quotient ``R^C / R·1`` rather than on raw ``R^C``.  The cheapest
+    # way to enforce this is to project ``v`` onto the zero-mean
+    # subspace at model layer 0:
+    #
+    #     P  = I - (1/C) 11^T          (Common Average Reference)
+    #     v_t -> P · v_t               (per timestep)
+    #
+    # ``P`` is the orthogonal projector onto ``{v : sum(v) = 0}``; it
+    # zeroes out the +c·1 gauge mode and preserves all the other
+    # ``C - 1`` directions exactly.  Application is O(C) per timestep
+    # and adds zero parameters.  See R2-C / R1-S1 for the
+    # affine-invariant-SPD ↔ gauge-quotient ↔ sheaf-cohomology chain.
+    #
+    #   use_reference_gauge       — turn the projection on / off.
+    #     False (default) keeps Toto byte-identical to exp48.
+    #
+    #   reference_gauge_method    — currently only ``"car"`` (Common
+    #     Average Reference).  ``"rest"`` is reserved for a future
+    #     experiment that will use the Yao 2001 REST projector
+    #     ``T_REST = G · (K^T K + λI)^(-1) · K^T`` derived from the
+    #     analytic 3-shell head model and electrode coordinates.
+    #     Listed but not implemented — defining the head model + lead
+    #     field at training time is materially more invasive and
+    #     deserves its own A/B.
+    #
+    #   gauge_augment_std         — std of an additive per-(batch,
+    #     timestep) constant ``c·1`` injected on the input *before*
+    #     CAR is applied (training only).  Mathematically a no-op
+    #     against pure CAR, but acts as a stress-test of the
+    #     projection: any path that bypasses CAR (e.g. a numerical
+    #     bug in the mask handling) becomes a sensitivity to the
+    #     random offset and is caught by an explosion of
+    #     val_observed_frac-weighted CAR residual.  Default 0.0
+    #     (off); the smoke YAML exercises it briefly.
+    # ----------------------------------------------------------------
+    use_reference_gauge: bool = False
+    reference_gauge_method: str = "car"
+    gauge_augment_std: float = 0.0
+
     @staticmethod
     def compute_residual_attn_ratio(context_length: int, patch_size: int) -> float:
         """sqrt(S / log(S)) where S = context_length / patch_size.
@@ -83,6 +130,16 @@ class Toto2ModelConfig:
             self.d_ff = (int(4 * self.d_model * 2 / 3) + 7) // 8 * 8
         if self.qk_norm_include_weight is None:
             self.qk_norm_include_weight = self.norm_include_weight
+        if self.use_reference_gauge:
+            if self.reference_gauge_method not in ("car",):
+                raise ValueError(
+                    f"reference_gauge_method must be 'car' (Yao 2001 REST is reserved "
+                    f"for a future experiment); got {self.reference_gauge_method!r}."
+                )
+            if self.gauge_augment_std < 0:
+                raise ValueError(
+                    f"gauge_augment_std must be >= 0; got {self.gauge_augment_std}."
+                )
         if self.residual_attn_ratio is None:
             if self.mp_residual:
                 # The τ-rule is unused when magnitude-preserving residual

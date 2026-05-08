@@ -92,6 +92,104 @@ def _resid_add(
 
 
 # =====================================================================
+# exp50 — Reference-electrode gauge projection (universal-EEG #2)
+# =====================================================================
+#
+# Helmholtz reciprocity says EEG voltages ``v`` are determined by neural
+# sources ``j`` only up to a +c·1 reference-electrode gauge: ``v`` and
+# ``v + c·1`` describe the same physical state for any scalar ``c``.
+# The orthogonal projector
+#
+#     P = I - (1/C) 11^T
+#
+# onto the zero-mean subspace ``{v : sum(v) = 0}`` quotients out exactly
+# this gauge.  Applying ``v_t ↦ P · v_t`` per timestep at model layer 0
+# (before the causal scaler) costs O(C) per timestep, adds zero
+# parameters, and gives a hard guarantee that the rest of the network
+# never sees the gauge mode.
+#
+# This corresponds to the Common Average Reference (CAR) widely used in
+# clinical EEG; the universal-EEG synthesis frames it as a structural
+# invariant of the data rather than a preprocessing step.  The
+# ``rest`` extension (Yao 2001) uses the head-model lead field to
+# project to a virtual reference at infinity; it requires electrode
+# coordinates and is reserved for a future experiment.
+#
+# References
+# ----------
+# - Yao, D.  "A method to standardize a reference of scalp EEG
+#   recordings to a point at infinity."  Physiol. Meas. 22 (2001).
+# - Pascual-Marqui, R.  "Reference-free EEG."  2002.
+# - Universal-EEG synthesis #2 (Notion exp50 page).
+
+
+class ReferenceGaugeProjection(nn.Module):
+    """Project the channel axis onto the zero-mean subspace per timestep.
+
+    Implements ``v_t ↦ P · v_t`` with ``P = I − (1/C) 11^T``.  This is
+    just per-timestep mean subtraction across the channel axis, with
+    correct handling of (a) padded variates (``series_ids == -1``) and
+    (b) NaN / Inf positions (``target_mask == False``) — both excluded
+    from the mean and left with their original values restored.
+
+    Parameters
+    ----------
+    gauge_augment_std
+        Std of an additive per-(*batch, timestep) constant injected
+        onto the input before the projection.  Training only.  By
+        construction CAR is invariant to this offset, so a non-zero
+        value is *mathematically* a no-op; we expose it as a knob so
+        the smoke test can stress-test the projection's mask handling
+        and catch silent bugs (any pathway that bypasses CAR will
+        develop a measurable sensitivity to ``c``).
+    """
+
+    def __init__(self, *, gauge_augment_std: float = 0.0):
+        super().__init__()
+        self.gauge_augment_std = float(gauge_augment_std)
+
+    def forward(
+        self,
+        target: Float[torch.Tensor, "*batch n_var time"],
+        target_mask: Bool[torch.Tensor, "*batch n_var time"],
+        series_ids: Int[torch.Tensor, "*batch n_var"],
+    ) -> Float[torch.Tensor, "*batch n_var time"]:
+        # Per-(*batch, time) channel mean over real, observed positions
+        # only.  ``valid_var`` masks out padding variates (series_id
+        # == -1); ``target_mask`` masks out NaN / Inf positions.  The
+        # boolean AND gives us the support of the mean.
+        valid_var = (series_ids != -1).unsqueeze(-1)  # (..., n_var, 1)
+        m = valid_var & target_mask
+        m_f = m.to(target.dtype)
+
+        # Optional gauge-stress augmentation (training only).  We add
+        # ``c`` BEFORE the projection so the projection has the chance
+        # to remove it; if anything in the pipeline silently bypasses
+        # the projection, the loss will become sensitive to ``c`` and
+        # will surface in the val / smoke metrics.
+        if self.training and self.gauge_augment_std > 0:
+            shape = list(target.shape)
+            shape[-2] = 1  # one constant per (*batch, 1, time), broadcast across n_var
+            offset = torch.randn(
+                *shape, device=target.device, dtype=target.dtype
+            ) * self.gauge_augment_std
+            target = torch.where(m, target + offset, target)
+
+        # Per-timestep channel mean over valid positions (avoid
+        # divide-by-zero by clamping the count).
+        sum_target = (target * m_f).sum(dim=-2, keepdim=True)
+        count = m_f.sum(dim=-2, keepdim=True).clamp_min(1.0)
+        mean = sum_target / count
+
+        # Subtract the mean only at valid positions; leave padding /
+        # NaN entries with their original values so the downstream
+        # ``target_mask & cpm_mask`` still controls what the scaler
+        # and patch_proj see.
+        out = torch.where(m, target - mean, target)
+        return out
+
+
+# =====================================================================
 # Scaler
 # =====================================================================
 
@@ -942,6 +1040,16 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
     def __init__(self, config: Toto2ModelConfig):
         super().__init__()
         self.config = config
+        # exp50 — optional reference-electrode gauge projection (CAR).
+        # Lives at model layer 0, before the causal scaler, so it
+        # quotients out the +c·1 gauge mode of every input timestep.
+        # Zero parameters, O(C) per timestep, ``None`` when disabled.
+        if config.use_reference_gauge:
+            self.reference_gauge: Optional[ReferenceGaugeProjection] = ReferenceGaugeProjection(
+                gauge_augment_std=config.gauge_augment_std,
+            )
+        else:
+            self.reference_gauge = None
         self.scaler = PatchedCausalStdScaler(
             patch_size=config.patch_size,
             stabilize_with_global=False,
@@ -997,6 +1105,13 @@ class Toto2Model(nn.Module, PyTorchModelHubMixin):
         series_ids: Int[torch.Tensor, "*batch n_var"],
         num_return_steps: Optional[int] = None,
     ) -> Toto2ModelOutputs:
+        # exp50 — apply the reference-gauge projection BEFORE the
+        # scaler so loc / scale are computed on the gauge-quotiented
+        # signal.  Otherwise the scaler would absorb the +c·1 mode
+        # into ``loc`` and downstream tokens would still encode it.
+        if self.reference_gauge is not None:
+            target = self.reference_gauge(target, target_mask, series_ids)
+
         scaled_series, loc, scale = self.scaler(target, target_mask & cpm_mask)
         scaled_series = scaled_series.asinh()
         x = self.patch_proj(

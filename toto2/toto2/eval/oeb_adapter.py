@@ -155,6 +155,13 @@ class Toto2EEGBenchModel(nn.Module):
         cpm_mask = target_mask
         series_ids = torch.arange(n_chans, device=x.device).unsqueeze(0).expand(batch, -1)
 
+        # exp50 — apply the reference-gauge projection BEFORE the scaler
+        # if the underlying model was trained with one.  Without this,
+        # downstream eval batches would carry a residual +c·1 reference
+        # mode that the trained model never saw at pretraining time.
+        if getattr(self._toto, "reference_gauge", None) is not None:
+            target = self._toto.reference_gauge(target, target_mask, series_ids)
+
         scaled, loc, scale = self._toto.scaler(target, target_mask & cpm_mask)
         scaled = scaled.asinh()
 
