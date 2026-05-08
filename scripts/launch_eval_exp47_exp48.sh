@@ -21,7 +21,7 @@ CKPT_EXP48_BEST=""  # filled in dynamically when exp48 completes
 GROUP_A=(arithmetic_zyma2019 bcic2a bcic2020_3 mdd_mumtaz2016)  # GPUs 0-3 (lighter / smaller)
 GROUP_B=(physionet chbmit faced isruc_sleep)                    # GPUs 4-7 (heavier)
 
-STRATS="frozen ridge_probe lora full_finetune"
+STRATS="frozen ridge_probe lora"   # full_finetune dropped per user (May 8); too slow vs the signal it gives
 HEAD="linear_head"
 N_SEEDS=3
 
