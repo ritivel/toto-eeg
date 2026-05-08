@@ -105,8 +105,9 @@ def main():
 
     # ---- Monkey-patch OEB Dataset.setup() to use a TOP-LEVEL callable instead
     # of a closure for the normalization transform. The original closure can't
-    # be pickled, so num_workers > 0 fails. This patch makes num_workers=N work.
-    if args.num_workers > 0:
+    # be pickled, so num_workers > 0 fails. We apply unconditionally because
+    # the cost is zero and it future-proofs increasing num_workers later.
+    if True:
         from open_eeg_bench import dataset as oeb_dataset
 
         class _PicklableNormTransform:
